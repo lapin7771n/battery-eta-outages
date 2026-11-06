@@ -3,5 +3,8 @@
   "name": "battery-eta-proxy",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-06",
-  "observability": { "enabled": true }
+  // Invocation logs and traces record the request URL, the query and SQL bindings; they stay off for privacy.
+  "observability": { "enabled": true, "logs": { "invocation_logs": false }, "traces": { "enabled": false } },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Gate"] }],
+  "secrets": { "required": ["ALERTS_ENERGY_KEY"] }
 }
