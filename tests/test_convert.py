@@ -61,22 +61,33 @@ def test_to_yasno():
             ("ScheduleApplies", [slot(0, 120)]),
         ),
         (
-            "queue the schedule does not mention waits",
+            "queue the schedule does not mention is left out",
             {TODAY: DaySchedule(TODAY, groups={"2.1": ()})},
             TODAY,
-            ("WaitingForSchedule", []),
-            ("WaitingForSchedule", []),
+            None,
+            None,
         ),
         (
-            "unparsed queue waits, emergency queue says so",
-            {TODAY: DaySchedule(TODAY, unknown={"1.1": "garbled"}), TOMORROW: DaySchedule(TOMORROW, unknown={"1.1": EMERGENCY})},
+            "queue unparsed today is left out even when tomorrow is fine",
+            {TODAY: DaySchedule(TODAY, unknown={"1.1": "garbled"}), TOMORROW: schedule(TOMORROW, ())},
             TODAY,
-            ("WaitingForSchedule", []),
+            None,
+            None,
+        ),
+        (
+            "emergency queue says so, missing tomorrow waits",
+            {TODAY: DaySchedule(TODAY, unknown={"1.1": EMERGENCY})},
+            TODAY,
             ("EmergencyShutdowns", []),
+            ("WaitingForSchedule", []),
         ),
     ]
     for label, days, today, want_today, want_tomorrow in cases:
-        group = to_yasno(days, ["1.1"], today)["1.1"]
+        result = to_yasno(days, ["1.1"], today)
+        if want_today is None:
+            assert "1.1" not in result, label
+            continue
+        group = result["1.1"]
         assert (group["today"]["status"], group["today"]["slots"]) == want_today, label
         assert (group["tomorrow"]["status"], group["tomorrow"]["slots"]) == want_tomorrow, label
 
