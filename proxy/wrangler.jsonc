@@ -3,5 +3,7 @@
   "name": "battery-eta-proxy",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-06",
-  "observability": { "enabled": true }
+  "observability": { "enabled": true, "traces": { "enabled": true } },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Gate"] }],
+  "secrets": { "required": ["ALERTS_ENERGY_KEY"] }
 }
