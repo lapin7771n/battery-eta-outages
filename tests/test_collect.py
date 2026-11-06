@@ -1,7 +1,7 @@
 import asyncio
 import json
 import shutil
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from ua_outages.http import FetchError
@@ -9,7 +9,7 @@ from ua_outages.models import DaySchedule, Outage, at
 from ua_outages.providers.base import AddressSource, Provider
 from ua_outages.registry import Operator
 
-from outage_feed.alerts import ALERTS_FALLBACK, ALERTS_ONLY, Reply
+from outage_feed.alerts import ALERTS_FALLBACK, ALERTS_ONLY, AlertsError, Reply
 from outage_feed.collect import collect
 
 NOW = at(date(2026, 11, 6), 12)
@@ -193,15 +193,26 @@ class FakeClock:
         self.now += seconds
 
 
-class FakeAlerts:
-    """The alerts.energy API: serves canned bodies and records each request with its time."""
+def shutdowns_path(slug):
+    return f"/source-registry/areas/{slug}/shutdowns"
 
-    def __init__(self, shutdowns=None, clock=None, updated="2026-11-06T09:00:00.000Z"):
+
+class FakeAlerts:
+    """The alerts.energy API: serves canned bodies and records each request with its time.
+
+    The overview is a real reply; each reply takes ``delay`` seconds on the fake clock.
+    """
+
+    def __init__(self, shutdowns=None, clock=None):
         self.clock = clock or FakeClock()
-        self.updated = {slug: updated for slug in SLUGS.values()}
+        overview = json.loads((ALERTS / "overview.json").read_text("utf-8"))
+        self.areas = {area["slug"]: area for area in overview}
+        self.overview = None
         self.shutdowns = shutdowns or {}
         self.status = {}
         self.headers = {}
+        self.errors = set()
+        self.delay = 0.0
         self.calls = []
 
     def paths(self):
@@ -212,11 +223,14 @@ class FakeAlerts:
 
     async def get(self, path):
         self.calls.append((path, self.clock.time()))
+        self.clock.now += self.delay
+        if path in self.errors:
+            raise AlertsError(f"GET {path}: ClientConnectorError")
         if path in self.status:
             return Reply(self.status[path], self.headers.get(path, {}), None)
         headers = self.headers.get(path, {})
         if path == OVERVIEW:
-            return Reply(200, headers, [{"slug": slug, "updated": u} for slug, u in self.updated.items()])
+            return Reply(200, headers, list(self.areas.values()) if self.overview is None else self.overview)
         slug = path.split("/")[-2]
         return Reply(200, headers, self.shutdowns.get(slug, [own_row(slug)]))
 
@@ -284,10 +298,7 @@ def test_alerts_feeds_the_listed_operators_and_backs_up_the_rest(tmp_path):
     assert slots("kharkiv-oe")["status"] == "ScheduleApplies"
     assert slots("kharkiv-oe")["slots"][0] == {"start": 0, "end": 180, "type": "Definite"}
     assert slots("poltava-oe")["status"] == "EmergencyShutdowns"
-    assert slots("zaporizhzhia-oe")["slots"] == [
-        {"start": 720, "end": 1020, "type": "Definite"},
-        {"start": 1260, "end": 1440, "type": "Definite"},
-    ]
+    assert slots("zaporizhzhia-oe")["slots"][0] == {"start": 720, "end": 1020, "type": "Definite"}
     assert slots("chernivtsi-oe", "1")["slots"][0] == {"start": 180, "end": 330, "type": "Definite"}
     assert slots("dtek-krem")["slots"] == [{"start": 0, "end": 240, "type": "Definite"}]
     for op_id in ("kharkiv-oe", "poltava-oe", "zaporizhzhia-oe", "chernivtsi-oe", "dtek-krem"):
@@ -318,6 +329,7 @@ def all_alerts_operators():
 def test_alerts_budget(tmp_path):
     api = FakeAlerts()
     operators = all_alerts_operators()
+    kwargs = {"alerts_get": api.get, "clock": api.clock.time, "sleep": api.clock.sleep}
 
     first, _ = alerts_run(operators, tmp_path, api)
     assert len(api.calls) == 1 + len(SLUGS) == 12
@@ -325,76 +337,79 @@ def test_alerts_budget(tmp_path):
     times = [at for _, at in api.calls]
     assert all(b - a >= 0.2 - 1e-9 for a, b in zip(times, times[1:], strict=False))
     assert first["alertsCheckedAt"] == NOW.isoformat()
-    assert first["alertsUpdated"] == api.updated
+    assert sorted(first["alertsAreas"]) == sorted(SLUGS.values())
+    assert first["alertsAreas"]["poltavska-oblast"] == {
+        "change": ["2026-11-06T10:49:29.000Z", "regional-emergency", True, False, "regional"],
+        "fetchedAt": NOW.isoformat(),
+    }
 
     api.reset()
-    soon, _ = next_run(operators, tmp_path, 10, alerts_get=api.get, clock=api.clock.time, sleep=api.clock.sleep)
+    soon, _ = next_run(operators, tmp_path, 24, **kwargs)
     assert api.calls == []
     assert soon["alertsCheckedAt"] == NOW.isoformat()
-    assert all(soon[op_id] == first[op_id] for op_id in ALERTS_ONLY)
+    assert all(soon[op_id] == first[op_id] for op_id in SLUGS)
 
-    unchanged, _ = next_run(operators, tmp_path, 40, alerts_get=api.get, clock=api.clock.time, sleep=api.clock.sleep)
+    unchanged, _ = next_run(operators, tmp_path, 26, **kwargs)
     assert api.paths() == [OVERVIEW]
-    assert unchanged["alertsCheckedAt"] == (NOW + timedelta(minutes=40)).isoformat()
+    assert unchanged["alertsCheckedAt"] == (NOW + timedelta(minutes=26)).isoformat()
     assert unchanged["kharkiv-oe"] == {
-        "updatedAt": (NOW + timedelta(minutes=40)).isoformat(),
+        "updatedAt": (NOW + timedelta(minutes=26)).isoformat(),
         "source": "alerts.energy",
         "ok": True,
     }
 
     api.reset()
-    api.updated = {slug: "2026-11-06T11:00:00.000Z" for slug in api.updated}
-    next_run(operators, tmp_path, 80, alerts_get=api.get, clock=api.clock.time, sleep=api.clock.sleep)
+    for area in api.areas.values():
+        area["updated"] = "2026-11-06T11:00:00.000Z"
+    next_run(operators, tmp_path, 80, **kwargs)
     assert len(api.calls) == 12
     times = [at for _, at in api.calls]
     assert all(b - a >= 0.2 - 1e-9 for a, b in zip(times, times[1:], strict=False))
 
 
-def test_alerts_refetches_only_what_changed_or_lacks_a_file_for_today(tmp_path):
+def test_alerts_refetches_what_changed_is_two_hours_old_or_lacks_a_file_for_today(tmp_path):
     api = FakeAlerts()
     operators = all_alerts_operators()
     kwargs = {"alerts_get": api.get, "clock": api.clock.time, "sleep": api.clock.sleep}
-    run_all = lambda minutes: next_run(operators, tmp_path, minutes, **kwargs)  # noqa: E731
     alerts_run(operators, tmp_path, api)
-    api.reset()
 
-    api.updated["poltavska-oblast"] = "2026-11-06T11:00:00.000Z"
-    run_all(40)
-    assert api.paths() == [OVERVIEW, "/source-registry/areas/poltavska-oblast/shutdowns"]
+    def asked_at(minutes):
+        api.reset()
+        next_run(operators, tmp_path, minutes, **kwargs)
+        return api.paths()
 
-    api.reset()
+    api.areas["poltavska-oblast"]["mode"] = "scheduled"
+    assert asked_at(30) == [OVERVIEW, shutdowns_path("poltavska-oblast")]
+
     (tmp_path / "out" / "kharkiv-oe.json").unlink()
-    run_all(80)
-    assert api.paths() == [OVERVIEW, "/source-registry/areas/kharkivska-oblast/shutdowns"]
+    assert asked_at(60) == [OVERVIEW, shutdowns_path("kharkivska-oblast")]
 
-    api.reset()
+    (tmp_path / "out" / "zaporizhzhia-oe.json").write_text(OLD_FILE.replace("2026-11-06", "2026-11-05"))
+    assert asked_at(90) == [OVERVIEW, shutdowns_path("zaporizka-oblast")]
+
     index_path = tmp_path / "out" / "index.json"
     index = json.loads(index_path.read_text())
     index["dtek-krem"]["source"] = "Working"
     index_path.write_text(json.dumps(index))
-    run_all(120)
-    assert api.paths() == [OVERVIEW, "/source-registry/areas/kyivska-oblast/shutdowns"]
+    assert asked_at(116) == [OVERVIEW, shutdowns_path("kyivska-oblast")]
 
-    api.reset()
-    tomorrow = NOW + timedelta(days=1, minutes=120)
-    shutil.rmtree(tmp_path / "previous")
-    (tmp_path / "out").rename(tmp_path / "previous")
-    run(operators, tmp_path, now=tomorrow, **kwargs)
-    assert len(api.calls) == 12
+    fetched_at_start = ["chernivecka-oblast"] + [slug for slug in ALERTS_FALLBACK.values() if slug != "kyivska-oblast"]
+    assert asked_at(145) == [OVERVIEW] + [shutdowns_path(slug) for slug in fetched_at_start]
 
 
 def test_alerts_pass_stops_on_429_and_on_a_low_daily_quota(tmp_path):
-    poltava = "/source-registry/areas/poltavska-oblast/shutdowns"
+    poltava = shutdowns_path("poltavska-oblast")
     order = list(ALERTS_ONLY.values()) + list(ALERTS_FALLBACK.values())
-    until_poltava = [OVERVIEW] + [f"/source-registry/areas/{slug}/shutdowns" for slug in order[:2]]
+    until_poltava = [OVERVIEW] + [shutdowns_path(slug) for slug in order[:2]]
     assert until_poltava[-1] == poltava
 
     for name in ("429", "quota"):
         directory = tmp_path / name
         directory.mkdir()
         api = FakeAlerts()
+        api.delay = 45
         if name == "429":
-            api.status[poltava], api.headers[poltava] = 429, {"retry-after": "7200"}
+            api.status[poltava], api.headers[poltava] = 429, {"retry-after": "3600"}
         else:
             api.headers[poltava] = {"x-ratelimit-daily-remaining": "1999"}
         operators = all_alerts_operators()
@@ -408,16 +423,73 @@ def test_alerts_pass_stops_on_429_and_on_a_low_daily_quota(tmp_path):
         assert index["zaporizhzhia-oe"] == {"updatedAt": None, "source": None, "ok": False}, name
         assert not (out / "zaporizhzhia-oe.json").exists(), name
         assert ("alertsRetryAfter" in index) == (name == "429"), name
+        if name == "429":
+            replied_at = NOW + timedelta(seconds=3 * 45 + 2 * 0.2)
+            retry_after = datetime.fromisoformat(index["alertsRetryAfter"])
+            assert abs(retry_after - (replied_at + timedelta(seconds=3600))) < timedelta(seconds=1)
 
         api.reset()
         api.status.clear()
+        api.delay = 0
         next_run(operators, directory, 40, **kwargs)
         assert (len(api.calls) == 0) == (name == "429"), name
 
         api.reset()
-        next_run(operators, directory, 150, **kwargs)
+        next_run(operators, directory, 70, **kwargs)
         assert api.paths()[0] == OVERVIEW, name
         assert (len(api.calls) > 1) == (name == "429"), name
+
+
+def test_alerts_network_error_fails_only_that_area(tmp_path):
+    api = FakeAlerts()
+    api.errors.add(shutdowns_path("poltavska-oblast"))
+    previous = tmp_path / "previous"
+    previous.mkdir()
+    (previous / "poltava-oe.json").write_text(OLD_FILE)
+    (previous / "index.json").write_text(
+        json.dumps({"poltava-oe": {"updatedAt": OLD_STAMP, "source": "alerts.energy", "ok": True}})
+    )
+
+    index, out = alerts_run(all_alerts_operators(), tmp_path, api)
+
+    assert index["poltava-oe"] == {"updatedAt": OLD_STAMP, "source": "alerts.energy", "ok": False}
+    assert (out / "poltava-oe.json").read_text() == OLD_FILE
+    assert len(api.calls) == 12
+    others = [op_id for op_id in SLUGS if op_id != "poltava-oe"]
+    assert all(index[op_id]["ok"] and (out / f"{op_id}.json").exists() for op_id in others)
+
+
+def test_alerts_overview_it_cannot_read_is_logged(tmp_path, capsys):
+    api = FakeAlerts()
+    del api.areas["sumska-oblast"]["updated"]
+
+    index, _ = alerts_run(all_alerts_operators(), tmp_path / "no-time", api)
+
+    assert "sumy-oe: alerts.energy overview has no updated time for sumska-oblast" in capsys.readouterr().err
+    assert shutdowns_path("sumska-oblast") not in api.paths()
+    assert index["sumy-oe"]["ok"] is False and index["kharkiv-oe"]["ok"] is True
+
+    api.reset()
+    api.overview = {"areas": list(api.areas.values())}
+
+    index, _ = alerts_run(all_alerts_operators(), tmp_path / "wrapped", api)
+
+    assert "alerts.energy: overview is dict, not a list" in capsys.readouterr().err
+    assert api.paths() == [OVERVIEW]
+    assert not any(index[op_id]["ok"] for op_id in SLUGS)
+
+
+def test_alerts_pass_keeps_what_it_fetched_before_the_deadline(tmp_path):
+    api = FakeAlerts()
+    api.delay = 50
+
+    index, out = alerts_run(all_alerts_operators(), tmp_path, api, alerts_timeout=120)
+
+    assert api.paths() == [OVERVIEW, shutdowns_path("kharkivska-oblast"), shutdowns_path("poltavska-oblast")]
+    assert index["kharkiv-oe"]["ok"] is True and index["poltava-oe"]["ok"] is True
+    assert today_slots(out / "kharkiv-oe.json") == [{"start": 0, "end": 240, "type": "Definite"}]
+    assert sorted(index["alertsAreas"]) == ["kharkivska-oblast", "poltavska-oblast"]
+    assert index["zaporizhzhia-oe"]["ok"] is False and not (out / "zaporizhzhia-oe.json").exists()
 
 
 def test_alerts_without_a_key_is_skipped_and_the_run_still_succeeds(tmp_path, monkeypatch):

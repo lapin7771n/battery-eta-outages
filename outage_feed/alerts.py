@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -37,11 +38,19 @@ ALERTS_FALLBACK = {
 }
 
 PASS_EVERY = timedelta(minutes=30)
+#: GitHub starts cron runs late by varying amounts, so a run a little under ``PASS_EVERY`` still passes.
+PASS_SLACK = timedelta(minutes=5)
+#: An area fetched this long ago is fetched again even if the overview shows no change.
+MAX_AGE = timedelta(hours=2)
 MIN_GAP = 0.2
 MIN_DAILY_REMAINING = 2000
 DEFAULT_RETRY_AFTER = 60
 OVERVIEW = "/source-registry/areas/overview"
 OBLENERGO = "_oblenergo"
+#: Overview fields whose change means an area's shutdowns changed.
+CHANGE_FIELDS = ("updated", "mode", "has_gpv", "gpv_cancelled", "emergency_scope")
+#: ``index.json`` keys the alerts pass keeps between runs.
+META_KEYS = ("alertsCheckedAt", "alertsAreas", "alertsRetryAfter")
 
 _WHOLE, _FIRST_HALF, _SECOND_HALF = 1, 2, 3
 
@@ -200,6 +209,25 @@ def _has_today(path: Path, today: date) -> bool:
         return False
 
 
+def _change_keys(body: Any) -> dict[str, list] | None:
+    """Change key by area slug from the overview reply, or ``None`` when the reply is not a list."""
+    if not isinstance(body, list):
+        print(f"{SOURCE}: overview is {type(body).__name__}, not a list", file=sys.stderr)
+        return None
+    return {
+        a["slug"]: [a.get(name) for name in CHANGE_FIELDS]
+        for a in body
+        if isinstance(a, dict) and isinstance(a.get("slug"), str) and isinstance(a.get("updated"), str)
+    }
+
+
+def _fresh(stored: Any, key: list, now: datetime) -> bool:
+    if not isinstance(stored, dict) or stored.get("change") != key:
+        return False
+    fetched = _when(stored.get("fetchedAt"))
+    return fetched is not None and now - fetched < MAX_AGE
+
+
 async def run_pass(
     wanted: Mapping[str, str],
     get: Get,
@@ -209,29 +237,38 @@ async def run_pass(
     now: datetime,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    started: float | None = None,
+    deadline: float = math.inf,
 ) -> Outcome:
     """One pass over the areas of ``wanted`` (operator id -> area slug).
 
-    It asks for the overview once, then for the shutdowns of each area that changed since the last
-    pass or has no file for today. It does nothing when the last pass was under ``PASS_EVERY`` ago
-    or alerts.energy asked us to wait. A 429 or a low daily quota ends the pass.
+    It asks for the overview once, then for the shutdowns of each area whose overview fields changed,
+    whose last fetch is ``MAX_AGE`` old or that has no file for today. It does nothing when the last
+    pass was under ``PASS_EVERY - PASS_SLACK`` ago or alerts.energy asked us to wait. A 429, a low daily
+    quota or passing ``deadline`` (on ``clock``) ends the pass; what it fetched so far is kept.
+    ``started`` is the ``clock`` reading taken with ``now``.
     """
-    meta = {k: old_index[k] for k in ("alertsCheckedAt", "alertsUpdated", "alertsRetryAfter") if k in old_index}
+    started = clock() if started is None else started
+    meta = {k: old_index[k] for k in META_KEYS if k in old_index}
     checked, retry_after = _when(old_index.get("alertsCheckedAt")), _when(old_index.get("alertsRetryAfter"))
-    if (checked and now - checked < PASS_EVERY) or (retry_after and now < retry_after):
+    if (checked and now - checked < PASS_EVERY - PASS_SLACK) or (retry_after and now < retry_after):
         return Outcome(skipped=True, meta=meta)
 
     outcome = Outcome(meta=meta)
     meta["alertsCheckedAt"] = now.isoformat()
     meta.pop("alertsRetryAfter", None)
-    stored = old_index.get("alertsUpdated")
-    updated: dict[str, str] = dict(stored) if isinstance(stored, dict) else {}
-    meta["alertsUpdated"] = updated
+    stored = old_index.get("alertsAreas")
+    seen: dict[str, Any] = dict(stored) if isinstance(stored, dict) else {}
+    meta["alertsAreas"] = seen
     call = _Paced(get, clock, sleep)
     stopped = False
 
     async def ask(path: str) -> Reply | None:
         nonlocal stopped
+        if clock() >= deadline:
+            stopped = True
+            print(f"{SOURCE}: out of time before {path}, stopping", file=sys.stderr)
+            return None
         try:
             reply = await call(path)
         except AlertsError as err:
@@ -242,7 +279,7 @@ async def run_pass(
                 seconds = max(int(reply.headers["retry-after"]), 0)
             except (KeyError, ValueError):
                 seconds = DEFAULT_RETRY_AFTER
-            meta["alertsRetryAfter"] = (now + timedelta(seconds=seconds)).isoformat()
+            meta["alertsRetryAfter"] = (now + timedelta(seconds=clock() - started + seconds)).isoformat()
             stopped = True
             print(f"{SOURCE}: HTTP 429 on {path}, stopping", file=sys.stderr)
             return None
@@ -255,24 +292,27 @@ async def run_pass(
         return reply
 
     overview = await ask(OVERVIEW)
-    if overview is None or not isinstance(overview.body, list):
+    keys = _change_keys(overview.body) if overview is not None else None
+    if keys is None:
         outcome.failed = set(wanted)
         return outcome
-    areas = {a.get("slug"): a.get("updated") for a in overview.body if isinstance(a, dict)}
 
     for op_id, slug in wanted.items():
-        area = areas.get(slug)
+        key = keys.get(slug)
         old = old_index.get(op_id)
+        if key is None:
+            print(f"{op_id}: {SOURCE} overview has no updated time for {slug}", file=sys.stderr)
+            outcome.failed.add(op_id)
+            continue
         if (
-            isinstance(area, str)
-            and updated.get(slug) == area
+            _fresh(seen.get(slug), key, now)
             and isinstance(old, dict)
             and old.get("source") == SOURCE
             and _has_today(previous / f"{op_id}.json", now.date())
         ):
             outcome.unchanged.add(op_id)
             continue
-        if stopped or not isinstance(area, str):
+        if stopped:
             outcome.failed.add(op_id)
             continue
         reply = await ask(f"/source-registry/areas/{slug}/shutdowns")
@@ -282,6 +322,6 @@ async def run_pass(
                 print(f"{op_id}: {SOURCE} has no {OBLENERGO} rows for {slug}", file=sys.stderr)
             outcome.failed.add(op_id)
             continue
-        updated[slug] = area
+        seen[slug] = {"change": key, "fetchedAt": now.isoformat()}
         outcome.rows[op_id] = own
     return outcome

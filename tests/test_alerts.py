@@ -87,6 +87,7 @@ def test_alerts_days_statuses_and_dates():
         row("bad-length", [1, 1], status="ScheduleApplies"),
         row("bad-code", hours(h1=4), status="ScheduleApplies"),
         row("both", tomorrow=hours(h2=1), tomorrow_status="ScheduleApplies", tomorrow_possible=hours(h5=3)),
+        row("no-possible", [], status="WaitingForSchedule", tomorrow=hours(h1=1), tomorrow_status="ScheduleApplies"),
         row("stale", hours(h1=1), today_date="2026-11-05"),
     ]
 
@@ -97,8 +98,9 @@ def test_alerts_days_statuses_and_dates():
     assert spans(days[TODAY], "applies") == [(60, 120, False)]
     assert days[TODAY].outages("none") == () and days[TODAY].outages("none-with-hours") == ()
     assert days[TODAY].unknown == {"emergency": EMERGENCY}
-    assert sorted(days[TOMORROW].groups) == ["both"]
+    assert sorted(days[TOMORROW].groups) == ["both", "no-possible"]
     assert spans(days[TOMORROW], "both") == [(120, 180, False), (330, 360, True)]
+    assert spans(days[TOMORROW], "no-possible") == [(60, 120, False)]
     assert alerts_days([row(status="WaitingForSchedule")], TODAY) == {}
 
 

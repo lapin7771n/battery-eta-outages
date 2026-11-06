@@ -19,6 +19,7 @@ from outage_feed.alerts import (
     ALERTS_FALLBACK,
     ALERTS_ONLY,
     KEY_VARIABLE,
+    META_KEYS,
     SOURCE,
     Get,
     Outcome,
@@ -85,25 +86,29 @@ async def _alerts_pass(
     old_index: dict,
     previous: Path,
     now: datetime,
+    started: float,
     timeout: float,
     clock: Callable[[], float],
     sleep: Callable[[float], Awaitable[None]],
 ) -> Outcome:
-    carried = {k: old_index[k] for k in ("alertsCheckedAt", "alertsUpdated", "alertsRetryAfter") if k in old_index}
+    carried = {k: old_index[k] for k in META_KEYS if k in old_index}
     key = os.environ.get(KEY_VARIABLE)
     if alerts_get is None and not key:
         print(f"{SOURCE}: {KEY_VARIABLE} is not set, skipping", file=sys.stderr)
         return Outcome(failed=set(wanted), meta=carried)
     async with new_session() as session:
         get = alerts_get or live_get(session, key or "")
-        try:
-            return await asyncio.wait_for(
-                run_pass(wanted, get, old_index=old_index, previous=previous, now=now, clock=clock, sleep=sleep),
-                timeout,
-            )
-        except TimeoutError:
-            print(f"{SOURCE}: no answer within {timeout:g} s", file=sys.stderr)
-            return Outcome(failed=set(wanted), meta={**carried, "alertsCheckedAt": now.isoformat()})
+        return await run_pass(
+            wanted,
+            get,
+            old_index=old_index,
+            previous=previous,
+            now=now,
+            clock=clock,
+            sleep=sleep,
+            started=started,
+            deadline=clock() + timeout,
+        )
 
 
 async def collect(
@@ -113,11 +118,13 @@ async def collect(
     *,
     now: datetime | None = None,
     timeout: float = 120,
+    alerts_timeout: float = 120,
     alerts_get: Get | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> dict[str, Any]:
     now = (now or now_kyiv()).astimezone(KYIV)
+    started = clock()
     out.mkdir(parents=True, exist_ok=True)
     old_index = _read_json(previous / "index.json")
     if not isinstance(old_index, dict):
@@ -137,11 +144,16 @@ async def collect(
         for op in polled
         if op.id in ALERTS_ONLY or (op.id in ALERTS_FALLBACK and fetched[op.id] is None)
     }
-    outcome = await _alerts_pass(wanted, alerts_get, old_index, previous, now, timeout, clock, sleep) if wanted else None
+    outcome = (
+        await _alerts_pass(wanted, alerts_get, old_index, previous, now, started, alerts_timeout, clock, sleep)
+        if wanted
+        else None
+    )
 
     index: dict[str, Any] = {}
     for op in polled:
         stamp = {"updatedAt": now.isoformat(), "source": SOURCE, "ok": True}
+        old = old_index.get(op.id)
         if op.id in wanted and outcome is not None and op.id in outcome.rows:
             days = alerts_days(outcome.rows[op.id], now.date())
             _write_json(out / f"{op.id}.json", to_yasno(days, op.groups, now.date()))
@@ -149,9 +161,13 @@ async def collect(
         elif op.id in wanted and outcome is not None and op.id in outcome.unchanged:
             _keep_previous(op.id, out, previous)
             index[op.id] = stamp
-        elif op.id in ALERTS_ONLY and outcome is not None and outcome.skipped:
+        elif (
+            op.id in wanted
+            and outcome is not None
+            and outcome.skipped
+            and (op.id in ALERTS_ONLY or (isinstance(old, dict) and old.get("source") == SOURCE))
+        ):
             _keep_previous(op.id, out, previous)
-            old = old_index.get(op.id)
             index[op.id] = old if isinstance(old, dict) else _failed_entry(old_index, op.id)
         elif (result := fetched.get(op.id)) is not None:
             source_name, days = result
@@ -163,7 +179,7 @@ async def collect(
     if outcome is not None:
         index.update(outcome.meta)
     else:
-        index.update({k: old_index[k] for k in ("alertsCheckedAt", "alertsUpdated", "alertsRetryAfter") if k in old_index})
+        index.update({k: old_index[k] for k in META_KEYS if k in old_index})
     _write_json(out / "index.json", index)
     return index
 
