@@ -64,7 +64,7 @@ PASS_SLACK = timedelta(minutes=5)
 MAX_AGE = timedelta(hours=2)
 #: Requests one pass may send, the overview included.
 MAX_REQUESTS = 20
-MIN_GAP = 0.2
+MIN_GAP = 0.5
 MIN_DAILY_REMAINING = 2000
 DEFAULT_RETRY_AFTER = 60
 OVERVIEW = "/source-registry/areas/overview"
@@ -268,9 +268,9 @@ async def run_pass(
 ) -> Outcome:
     """One pass over the areas of ``wanted`` (operator id -> area and initiator of its rows).
 
-    It asks for the overview once, then for the shutdowns of each area whose overview fields changed,
-    whose last fetch is ``MAX_AGE`` old or that has no ``<id>@alerts.json`` for today; operators of one
-    area share its reply. It sends at most ``MAX_REQUESTS`` requests. It does nothing when the last
+    It asks for the overview once, then for the shutdowns of the area of each operator whose area's
+    overview fields changed since the operator last got rows, whose last rows are ``MAX_AGE`` old or
+    that has no ``<id>@alerts.json`` for today; operators of one area share its reply. It sends at most ``MAX_REQUESTS`` requests. It does nothing when the last
     pass was under ``PASS_EVERY - PASS_SLACK`` ago or alerts.energy asked us to wait. A 429, a low daily
     quota or passing ``deadline`` (on ``clock``) ends the pass; what it fetched so far is kept.
     ``started`` is the ``clock`` reading taken with ``now``.
@@ -285,7 +285,8 @@ async def run_pass(
     meta["alertsCheckedAt"] = now.isoformat()
     meta.pop("alertsRetryAfter", None)
     stored = old_index.get("alertsAreas")
-    seen: dict[str, Any] = dict(stored) if isinstance(stored, dict) else {}
+    #: Change key and fetch time by operator id: operators of one area may get rows in different passes.
+    seen: dict[str, Any] = {k: v for k, v in stored.items() if k in wanted} if isinstance(stored, dict) else {}
     meta["alertsAreas"] = seen
     before = dict(seen)
     call = _Paced(get, clock, sleep)
@@ -338,7 +339,7 @@ async def run_pass(
             print(f"{op_id}: {SOURCE} overview has no updated time for {slug}", file=sys.stderr)
             outcome.failed.add(op_id)
             continue
-        if _fresh(before.get(slug), key, now) and _has_today(previous / f"{op_id}@alerts.json", now.date()):
+        if _fresh(before.get(op_id), key, now) and _has_today(previous / f"{op_id}@alerts.json", now.date()):
             outcome.unchanged.add(op_id)
             continue
         if slug not in bodies:
@@ -354,6 +355,6 @@ async def run_pass(
                 print(f"{op_id}: {SOURCE} has no {initiator} rows for {slug}", file=sys.stderr)
             outcome.failed.add(op_id)
             continue
-        seen[slug] = {"change": key, "fetchedAt": now.isoformat()}
+        seen[op_id] = {"change": key, "fetchedAt": now.isoformat()}
         outcome.rows[op_id] = own
     return outcome

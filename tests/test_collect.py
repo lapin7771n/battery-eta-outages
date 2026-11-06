@@ -9,9 +9,9 @@ from pathlib import Path
 import pytest
 from ua_outages.http import FetchError
 from ua_outages.models import DaySchedule, Outage, at
-from ua_outages.providers.base import AddressSource, Provider
+from ua_outages.providers.base import AddressSource, Kind, Provider
 from ua_outages.providers.chernihiv import Chernihiv
-from ua_outages.providers.dtek import DtekPage, OutageDataUa
+from ua_outages.providers.dtek import MIRROR_URL, DtekPage, OutageDataUa
 from ua_outages.providers.kirovohrad import CHANNELS, Kirovohrad
 from ua_outages.providers.yasno import Yasno
 from ua_outages.registry import OPERATORS, OPERATORS_BY_ID, Operator
@@ -352,10 +352,10 @@ def test_alerts_budget(tmp_path):
     assert len(api.calls) == 1 + len(SLUGS) == 14
     assert [path for path, _ in api.calls][0] == OVERVIEW
     times = [at for _, at in api.calls]
-    assert all(b - a >= 0.2 - 1e-9 for a, b in zip(times, times[1:], strict=False))
+    assert all(b - a >= 0.5 - 1e-9 for a, b in zip(times, times[1:], strict=False))
     assert first["alertsCheckedAt"] == NOW.isoformat()
-    assert sorted(first["alertsAreas"]) == sorted(SLUGS.values())
-    assert first["alertsAreas"]["poltavska-oblast"] == {
+    assert sorted(first["alertsAreas"]) == sorted(SLUGS)
+    assert first["alertsAreas"]["poltava-oe"] == {
         "change": ["2026-11-06T10:49:29.000Z", "regional-emergency", True, False, "regional"],
         "fetchedAt": NOW.isoformat(),
     }
@@ -393,7 +393,7 @@ def test_alerts_budget(tmp_path):
     next_run(operators, tmp_path, 80, **kwargs)
     assert len(api.calls) == 14
     times = [at for _, at in api.calls]
-    assert all(b - a >= 0.2 - 1e-9 for a, b in zip(times, times[1:], strict=False))
+    assert all(b - a >= 0.5 - 1e-9 for a, b in zip(times, times[1:], strict=False))
 
 
 def test_alerts_refetches_what_changed_is_two_hours_old_or_lacks_a_file_for_today(tmp_path):
@@ -452,7 +452,7 @@ def test_alerts_pass_stops_on_429_and_on_a_low_daily_quota(tmp_path):
         assert not (out / "zaporizhzhia-oe.json").exists(), name
         assert ("alertsRetryAfter" in index) == (name == "429"), name
         if name == "429":
-            replied_at = NOW + timedelta(seconds=3 * 45 + 2 * 0.2)
+            replied_at = NOW + timedelta(seconds=3 * 45 + 2 * 0.5)
             retry_after = datetime.fromisoformat(index["alertsRetryAfter"])
             assert abs(retry_after - (replied_at + timedelta(seconds=3600))) < timedelta(seconds=1)
 
@@ -518,7 +518,7 @@ def test_alerts_pass_keeps_what_it_fetched_before_the_deadline(tmp_path):
     assert api.paths() == [OVERVIEW, shutdowns_path("kharkivska-oblast"), shutdowns_path("poltavska-oblast")]
     assert index["kharkiv-oe"]["ok"] is True and index["poltava-oe"]["ok"] is True
     assert today_slots(out / "kharkiv-oe.json") == [{"start": 0, "end": 240, "type": "Definite"}]
-    assert sorted(index["alertsAreas"]) == ["kharkivska-oblast", "poltavska-oblast"]
+    assert sorted(index["alertsAreas"]) == ["kharkiv-oe", "poltava-oe"]
     assert index["zaporizhzhia-oe"]["ok"] is False and not (out / "zaporizhzhia-oe.json").exists()
 
 
@@ -759,8 +759,7 @@ def test_alerts_rows_come_from_the_operators_own_initiator_only(tmp_path):
     assert api.paths().count(shutdowns_path("kyiv")) == 1
 
 
-def test_a_pass_over_every_alerts_operator_stays_under_the_request_cap(tmp_path):
-    assert alerts.MAX_REQUESTS == 20
+def test_a_pass_over_every_alerts_operator_sends_one_request_per_area(tmp_path):
     assert sorted(ALERTS_AREAS) == sorted(
         [
             "dtek-kem",
@@ -817,3 +816,111 @@ def test_operators_of_one_area_both_refresh_when_the_area_changes(tmp_path):
     for op_id in ("dtek-dnem", "cek"):
         whole_day = [{"start": 0, "end": 1440, "type": "Definite"}]
         assert feed_file(out, f"{op_id}@alerts")["1.1"]["today"]["slots"] == whole_day
+
+    api.areas["dnipropetrovska-oblast"]["updated"] = "2026-11-06T11:00:00.000Z"
+    rows = api.shutdowns["dnipropetrovska-oblast"]
+    api.shutdowns["dnipropetrovska-oblast"] = [r for r in rows if not r["initiator"].endswith("_cek")]
+    next_run(operators, tmp_path, 60, **kwargs)
+    api.reset()
+
+    index, _ = next_run(operators, tmp_path, 90, **kwargs)
+
+    assert api.paths() == [OVERVIEW, shutdowns_path("dnipropetrovska-oblast")]
+    cek = [e for e in index["cek"]["sources"] if e["id"] == "alerts"]
+    assert cek == [{**cek[0], "ok": False, "updatedAt": (NOW + timedelta(minutes=30)).isoformat()}]
+    assert [e["ok"] for e in index["dtek-dnem"]["sources"] if e["id"] == "alerts"] == [True]
+
+
+class Channel(Working):
+    kind = Kind.TELEGRAM
+
+    def __init__(self, channel):
+        self.channel = channel
+
+
+def test_a_source_id_the_app_rejects_or_repeats_gets_no_file(tmp_path, capsys):
+    longest, too_long = "y" * 31, "x" * 32
+    op = operator(
+        "op", Channel("svitlo_Misto"), Channel(longest), Channel(too_long), Channel("bad/name"), Working(), Working()
+    )
+
+    index, out = run([op], tmp_path)
+
+    assert [(e["id"], e["name"]) for e in index["op"]["sources"]] == [
+        ("telegram-svitlo-misto", "Telegram: svitlo_Misto"),
+        (f"telegram-{longest}", f"Telegram: {longest}"),
+        ("telegram", "Telegram"),
+        ("operator", "Сайт обленерго"),
+    ]
+    published = ["op.json", "op@telegram-svitlo-misto.json", f"op@telegram-{longest}.json", "op@telegram.json"]
+    assert sorted(path.name for path in out.iterdir()) == sorted([*published, "op@operator.json", "index.json"])
+    err = capsys.readouterr().err
+    assert f"'telegram-{too_long}', not published" in err and "'operator', not published" in err
+
+
+class FakeSession:
+    """An aiohttp session that serves ``pages`` by URL and records each request."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.asked = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        pass
+
+    def request(self, method, url, **kwargs):
+        self.asked.append(str(url))
+        return FakePage(str(url), self.pages[str(url)])
+
+
+class FakePage:
+    status = 200
+    charset = "utf-8"
+
+    def __init__(self, url, body):
+        self.url = url
+        self.body = body.encode()
+        self.headers = {}
+        self.content = self
+
+    async def __aenter__(self):
+        await asyncio.sleep(0)
+        return self
+
+    async def __aexit__(self, *exc):
+        pass
+
+    async def iter_chunked(self, size):
+        await asyncio.sleep(0)
+        yield self.body
+
+
+def test_the_dtek_page_and_mirror_are_fetched_once_for_dnem_and_cek(tmp_path, monkeypatch):
+    def off_in_hour(hour):
+        return {str(h): "no" if h == hour else "yes" for h in range(1, 25)}
+
+    stamp = int(at(NOW.date(), 0).timestamp())
+    fact = {"data": {str(stamp): {"GPV1.1": off_in_hour(1), "GPV1001.1": off_in_hour(2)}}, "today": stamp}
+    dtek_page = "https://www.dtek-dnem.com.ua/ua/shutdowns"
+    mirror = MIRROR_URL.format(region="dnipro")
+    session = FakeSession(
+        {
+            dtek_page: f"<script>DisconSchedule.fact = {json.dumps(fact)}</script>",
+            mirror: json.dumps({"lastUpdated": NOW.isoformat(), "fact": fact}),
+        }
+    )
+    monkeypatch.setattr("outage_feed.collect.new_session", lambda: session)
+    operators = [
+        registry_operator(op_id, posing(Yasno, Working(), 3, 301), *OPERATORS_BY_ID[op_id].sources[1:])
+        for op_id in ("dtek-dnem", "cek")
+    ]
+
+    _, out = alerts_run(operators, tmp_path, dnipro_api())
+
+    assert sorted(session.asked) == sorted([dtek_page, mirror])
+    for name in ("dtek-site", "dtek-mirror"):
+        assert today_slots(out / f"dtek-dnem@{name}.json") == [{"start": 0, "end": 60, "type": "Definite"}]
+        assert today_slots(out / f"cek@{name}.json") == [{"start": 60, "end": 120, "type": "Definite"}]

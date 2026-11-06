@@ -7,12 +7,12 @@ import os
 import re
 import sys
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from ua_outages.http import Fetcher, new_session, redact
+from ua_outages.http import Fetcher, Response, new_session, redact
 from ua_outages.models import KYIV, DaySchedule, now_kyiv
 from ua_outages.providers.base import Kind, Provider
 from ua_outages.providers.dtek import DtekPage, OutageDataUa
@@ -58,16 +58,21 @@ def _channel(source: Provider) -> str | None:
     return channel if isinstance(channel, str) and _CHANNEL_RE.fullmatch(channel) else None
 
 
+#: The ids the app accepts.
+SOURCE_ID_RE = re.compile(r"[a-z0-9-]{2,40}")
+
+
 def source_id(source: Provider) -> str:
-    """The id in ``<operator>@<id>.json``."""
+    """The id in ``<operator>@<id>.json``; ``collect`` skips a source whose id breaks ``SOURCE_ID_RE``."""
     if isinstance(source, Yasno):
         return "yasno"
     if isinstance(source, DtekPage):
         return "dtek-site"
     if isinstance(source, OutageDataUa):
         return "dtek-mirror"
-    if source.kind is Kind.TELEGRAM and (channel := _channel(source)):
-        return f"telegram-{channel.lower()}"
+    if source.kind is Kind.TELEGRAM:
+        channel = _channel(source)
+        return f"telegram-{channel.lower().replace('_', '-')}" if channel else "telegram"
     return "operator"
 
 
@@ -80,8 +85,9 @@ def source_label(source: Provider) -> str:
         return "Сайт ДТЕК"
     if sid == "dtek-mirror":
         return "Копія ДТЕК (outage-data-ua)"
-    if sid.startswith("telegram-"):
-        return f"Telegram: {_channel(source)}"
+    if source.kind is Kind.TELEGRAM:
+        channel = _channel(source)
+        return f"Telegram: {channel}" if channel else "Telegram"
     return "Сайт обленерго"
 
 
@@ -101,10 +107,43 @@ def _queues(feed: Any) -> list[str]:
     return [queue for _, queue in sorted(ordered)]
 
 
-async def _fetch_source(op: Operator, source: Provider, session: Any, now: datetime, timeout: float) -> dict | None:
+class _SharedFetcher(Fetcher):
+    """A ``Fetcher`` whose GET shares one request with every identical GET of the run.
+
+    ``dtek-dnem`` and ``cek`` read the same DTEK page and mirror, each with its own group map.
+    """
+
+    def __init__(
+        self, session: Any, hosts: frozenset[str], shared: dict[tuple[Any, ...], asyncio.Task[Response]]
+    ) -> None:
+        super().__init__(session, hosts)
+        self._allowed_hosts = hosts
+        self._shared = shared
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Mapping[str, str] | None = None,
+        data: Mapping[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> Response:
+        if method != "GET" or data:
+            return await super().request(method, url, params=params, data=data, headers=headers)
+        key = (self._allowed_hosts, url, tuple(sorted((params or {}).items())), tuple(sorted((headers or {}).items())))
+        task = self._shared.get(key)
+        if task is None:
+            task = asyncio.ensure_future(super().request(method, url, params=params, headers=headers))
+            self._shared[key] = task
+        # One source timing out must not cancel the request another source waits for.
+        return await asyncio.shield(task)
+
+
+async def _fetch_source(op: Operator, source: Provider, http: Fetcher, now: datetime, timeout: float) -> dict | None:
     """Days the source published (maybe none), or ``None`` when it failed or did not answer in time."""
     try:
-        days = await asyncio.wait_for(source.fetch(Fetcher(session, source.hosts), now), timeout)
+        days = await asyncio.wait_for(source.fetch(http, now), timeout)
     except TimeoutError:
         print(f"{op.id}: {source.name} gave no answer within {timeout:g} s", file=sys.stderr)
         return None
@@ -232,8 +271,17 @@ async def collect(
     wanted = {op.id: ALERTS_AREAS[op.id] for op in polled if op.id in ALERTS_AREAS}
 
     async def fetch_all() -> list[dict | None]:
+        shared: dict[tuple[Any, ...], asyncio.Task[Response]] = {}
         async with new_session() as session:
-            return await asyncio.gather(*(_fetch_source(op, s, session, now, timeout) for op, s in jobs))
+            try:
+                return await asyncio.gather(
+                    *(_fetch_source(op, s, _SharedFetcher(session, s.hosts, shared), now, timeout) for op, s in jobs)
+                )
+            finally:
+                pending = [task for task in shared.values() if not task.done()]
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def alerts() -> Outcome | None:
         if not wanted:
@@ -250,8 +298,13 @@ async def collect(
         old = old_index.get(op.id)
         old_sources = _old_sources(old_index, op.id)
         entries: list[dict] = []
+        taken: set[str] = set()
         for source, days in fetched.get(op.id, []):
             sid = source_id(source)
+            if not SOURCE_ID_RE.fullmatch(sid) or sid in taken:
+                print(f"{op.id}: {source.name} has an invalid or repeated id {sid!r}, not published", file=sys.stderr)
+                continue
+            taken.add(sid)
             feed = None if days is None else to_yasno(days, op.groups, today)
             entry = _publish_source(out, previous, op.id, sid, source_label(source), feed, now, old_sources.get(sid))
             if entry:
