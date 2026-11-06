@@ -1,7 +1,7 @@
 import { env, exports } from "cloudflare:workers";
-import { createExecutionContext, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, createScheduledController, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import worker from "../src/index";
+import worker, { type CronEnv } from "../src/index";
 import houses from "./fixtures/houses-holovna.json";
 import queuesHolovna from "./fixtures/queues-holovna-3.json";
 import queuesIrpin from "./fixtures/queues-irpin-multi.json";
@@ -448,5 +448,46 @@ describe("cache", () => {
     expect((await cached()).map((row) => row.key)).not.toContain(key);
     await get(path);
     expect(upstream).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("feed cron", () => {
+  async function tick(token?: string) {
+    const ctx = createExecutionContext();
+    const withToken: CronEnv = { ...env, GITHUB_DISPATCH_TOKEN: token };
+    await worker.scheduled(createScheduledController({ scheduledTime: T0, cron: "*/10 * * * *" }), withToken, ctx);
+    await waitOnExecutionContext(ctx);
+  }
+
+  it("starts outage-feed.yml on main with the token, and sends nothing without one", async () => {
+    const calls: { url: string; method: string; auth: string | null; body: unknown }[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push({ url, method: init?.method ?? "GET", auth: new Headers(init?.headers).get("Authorization"), body: JSON.parse(String(init?.body)) });
+      return new Response(null, { status: 204 });
+    });
+
+    await tick();
+    expect(calls).toEqual([]);
+
+    await tick("gh-test-token");
+    expect(calls).toEqual([
+      {
+        url: "https://api.github.com/repos/lapin7771n/battery-eta-outages/actions/workflows/outage-feed.yml/dispatches",
+        method: "POST",
+        auth: "Bearer gh-test-token",
+        body: { ref: "main" },
+      },
+    ]);
+  });
+
+  it("logs a failed dispatch without the token and does not throw", async () => {
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line: string) => void lines.push(line));
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down gh-test-token"));
+    await tick("gh-test-token");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 401 }));
+    await tick("gh-test-token");
+    expect(lines).toEqual([JSON.stringify({ event: "dispatch_failed" }), JSON.stringify({ event: "dispatch", status: 401 })]);
   });
 });

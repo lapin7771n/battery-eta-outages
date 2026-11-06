@@ -5,6 +5,7 @@
   "compatibility_date": "2026-11-06",
   // Invocation logs and traces record the request URL, the query and SQL bindings; they stay off for privacy.
   "observability": { "enabled": true, "logs": { "invocation_logs": false }, "traces": { "enabled": false } },
+  "triggers": { "crons": ["*/10 * * * *"] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Gate"] }],
   "secrets": { "required": ["ALERTS_ENERGY_KEY"] }
 }
