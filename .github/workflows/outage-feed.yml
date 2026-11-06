@@ -39,6 +39,8 @@ jobs:
       - run: uv sync --locked
 
       - name: Collect schedules
+        env:
+          ALERTS_ENERGY_KEY: ${{ secrets.ALERTS_ENERGY_KEY }}
         run: uv run python -m outage_feed.collect --out out --previous previous
 
       - name: Publish as one orphan commit

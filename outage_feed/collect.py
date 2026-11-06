@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
-from collections.abc import Sequence
+import time
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,18 @@ from ua_outages.http import Fetcher, new_session, redact
 from ua_outages.models import KYIV, DaySchedule, now_kyiv
 from ua_outages.registry import OPERATORS, Operator
 
+from outage_feed.alerts import (
+    ALERTS_FALLBACK,
+    ALERTS_ONLY,
+    KEY_VARIABLE,
+    META_KEYS,
+    SOURCE,
+    Get,
+    Outcome,
+    alerts_days,
+    live_get,
+    run_pass,
+)
 from outage_feed.convert import to_yasno
 
 
@@ -54,29 +68,118 @@ async def _fetch_within(
         return None
 
 
+def _failed_entry(old_index: dict, op_id: str) -> dict:
+    old = old_index.get(op_id)
+    old = old if isinstance(old, dict) else {}
+    return {"updatedAt": old.get("updatedAt"), "source": old.get("source"), "ok": False}
+
+
+def _keep_previous(op_id: str, out: Path, previous: Path) -> None:
+    old_file = previous / f"{op_id}.json"
+    if old_file.is_file():
+        (out / old_file.name).write_bytes(old_file.read_bytes())
+
+
+async def _alerts_pass(
+    wanted: dict[str, str],
+    alerts_get: Get | None,
+    old_index: dict,
+    previous: Path,
+    now: datetime,
+    started: float,
+    timeout: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], Awaitable[None]],
+) -> Outcome:
+    carried = {k: old_index[k] for k in META_KEYS if k in old_index}
+    key = os.environ.get(KEY_VARIABLE)
+    if alerts_get is None and not key:
+        print(f"{SOURCE}: {KEY_VARIABLE} is not set, skipping", file=sys.stderr)
+        return Outcome(failed=set(wanted), meta=carried)
+    async with new_session() as session:
+        get = alerts_get or live_get(session, key or "")
+        return await run_pass(
+            wanted,
+            get,
+            old_index=old_index,
+            previous=previous,
+            now=now,
+            clock=clock,
+            sleep=sleep,
+            started=started,
+            deadline=clock() + timeout,
+        )
+
+
 async def collect(
-    operators: Sequence[Operator], out: Path, previous: Path, *, now: datetime | None = None, timeout: float = 120
-) -> dict[str, dict]:
+    operators: Sequence[Operator],
+    out: Path,
+    previous: Path,
+    *,
+    now: datetime | None = None,
+    timeout: float = 120,
+    alerts_timeout: float = 120,
+    alerts_get: Get | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> dict[str, Any]:
     now = (now or now_kyiv()).astimezone(KYIV)
+    started = clock()
     out.mkdir(parents=True, exist_ok=True)
     old_index = _read_json(previous / "index.json")
     if not isinstance(old_index, dict):
         old_index = {}
-    polled = [op for op in operators if not op.by_address and any(not s.ukraine_only for s in op.sources)]
+    polled = [
+        op
+        for op in operators
+        if op.id in ALERTS_ONLY or (not op.by_address and any(not s.ukraine_only for s in op.sources))
+    ]
+    free = [op for op in polled if op.id not in ALERTS_ONLY]
     async with new_session() as session:
-        results = await asyncio.gather(*(_fetch_within(op, session, now, timeout) for op in polled))
-    index: dict[str, dict] = {}
-    for op, fetched in zip(polled, results, strict=True):
-        if fetched is not None:
-            source_name, days = fetched
+        results = await asyncio.gather(*(_fetch_within(op, session, now, timeout) for op in free))
+    fetched = dict(zip((op.id for op in free), results, strict=True))
+
+    wanted = {
+        op.id: ALERTS_ONLY.get(op.id) or ALERTS_FALLBACK[op.id]
+        for op in polled
+        if op.id in ALERTS_ONLY or (op.id in ALERTS_FALLBACK and fetched[op.id] is None)
+    }
+    outcome = (
+        await _alerts_pass(wanted, alerts_get, old_index, previous, now, started, alerts_timeout, clock, sleep)
+        if wanted
+        else None
+    )
+
+    index: dict[str, Any] = {}
+    for op in polled:
+        stamp = {"updatedAt": now.isoformat(), "source": SOURCE, "ok": True}
+        old = old_index.get(op.id)
+        if op.id in wanted and outcome is not None and op.id in outcome.rows:
+            days = alerts_days(outcome.rows[op.id], now.date())
+            _write_json(out / f"{op.id}.json", to_yasno(days, op.groups, now.date()))
+            index[op.id] = stamp
+        elif op.id in wanted and outcome is not None and op.id in outcome.unchanged:
+            _keep_previous(op.id, out, previous)
+            index[op.id] = stamp
+        elif (
+            op.id in wanted
+            and outcome is not None
+            and outcome.skipped
+            and (op.id in ALERTS_ONLY or (isinstance(old, dict) and old.get("source") == SOURCE))
+        ):
+            _keep_previous(op.id, out, previous)
+            index[op.id] = old if isinstance(old, dict) else _failed_entry(old_index, op.id)
+        elif (result := fetched.get(op.id)) is not None:
+            source_name, days = result
             _write_json(out / f"{op.id}.json", to_yasno(days, op.groups, now.date()))
             index[op.id] = {"updatedAt": now.isoformat(), "source": source_name, "ok": True}
-            continue
-        old = old_index.get(op.id) or {}
-        index[op.id] = {"updatedAt": old.get("updatedAt"), "source": old.get("source"), "ok": False}
-        old_file = previous / f"{op.id}.json"
-        if old_file.is_file():
-            (out / old_file.name).write_bytes(old_file.read_bytes())
+        else:
+            index[op.id] = _failed_entry(old_index, op.id)
+            _keep_previous(op.id, out, previous)
+    if outcome is not None:
+        index.update(outcome.meta)
+    else:
+        index.update({k: old_index[k] for k in META_KEYS if k in old_index})
     _write_json(out / "index.json", index)
     return index
 
@@ -88,7 +191,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     index = asyncio.run(collect(OPERATORS, args.out, args.previous))
     for op_id, entry in index.items():
-        print(f"{op_id}: {'ok' if entry['ok'] else 'FAILED'} ({entry['source']})")
+        if isinstance(entry, dict) and "ok" in entry:
+            print(f"{op_id}: {'ok' if entry['ok'] else 'FAILED'} ({entry['source']})")
 
 
 if __name__ == "__main__":
