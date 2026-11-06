@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import aiohttp
 from ua_outages.http import MAX_BYTES, USER_AGENT, redact, ssl_context
@@ -25,6 +25,7 @@ ALERTS_ONLY = {
     "poltava-oe": "poltavska-oblast",
     "zaporizhzhia-oe": "zaporizka-oblast",
     "chernivtsi-oe": "chernivecka-oblast",
+    "vinnytsia-oe": "vinnytska-oblast",
 }
 #: Operators that read alerts.energy as the last source, when every free source failed.
 ALERTS_FALLBACK = {
@@ -35,6 +36,25 @@ ALERTS_FALLBACK = {
     "dtek-oem": "odeska-oblast",
     "sumy-oe": "sumska-oblast",
     "cherkasy-oe": "cherkaska-oblast",
+    "chernihiv-oe": "chernigivska-oblast",
+}
+#: Fallback operators whose own source counts as failed when it gives no queue: its reply is days without hours.
+ALERTS_IF_EMPTY = frozenset({"chernihiv-oe"})
+
+
+class Area(NamedTuple):
+    slug: str
+    #: Suffix of the ``initiator`` of the rows the operator owns.
+    initiator: str = "_oblenergo"
+
+
+#: Every operator alerts.energy has rows for, with the area and the initiator of its rows. Each gets
+#: ``<id>@alerts.json``; ``ALERTS_ONLY`` and ``ALERTS_FALLBACK`` say when that file is also ``<id>.json``.
+ALERTS_AREAS = {
+    "dtek-kem": Area("kyiv"),
+    "dtek-dnem": Area("dnipropetrovska-oblast"),
+    "cek": Area("dnipropetrovska-oblast", "_cek"),
+    **{op_id: Area(slug) for op_id, slug in {**ALERTS_ONLY, **ALERTS_FALLBACK}.items()},
 }
 
 PASS_EVERY = timedelta(minutes=30)
@@ -42,7 +62,9 @@ PASS_EVERY = timedelta(minutes=30)
 PASS_SLACK = timedelta(minutes=5)
 #: An area fetched this long ago is fetched again even if the overview shows no change.
 MAX_AGE = timedelta(hours=2)
-MIN_GAP = 0.2
+#: Requests one pass may send, the overview included.
+MAX_REQUESTS = 20
+MIN_GAP = 0.5
 MIN_DAILY_REMAINING = 2000
 DEFAULT_RETRY_AFTER = 60
 OVERVIEW = "/source-registry/areas/overview"
@@ -94,9 +116,13 @@ def live_get(session: Any, key: str) -> Get:
     return get
 
 
+def initiator_rows(rows: Iterable[Any], initiator: str) -> list[dict]:
+    """Rows whose ``initiator`` ends with ``initiator``; the railway's (``_uz``) and anyone else's are dropped."""
+    return [r for r in rows if isinstance(r, dict) and str(r.get("initiator", "")).endswith(initiator)]
+
+
 def oblenergo_rows(rows: Iterable[Any]) -> list[dict]:
-    """Rows of the regional operator; the railway's (``_uz``) and anyone else's are dropped."""
-    return [r for r in rows if isinstance(r, dict) and str(r.get("initiator", "")).endswith(OBLENERGO)]
+    return initiator_rows(rows, OBLENERGO)
 
 
 def _day(value: Any) -> date | None:
@@ -229,7 +255,7 @@ def _fresh(stored: Any, key: list, now: datetime) -> bool:
 
 
 async def run_pass(
-    wanted: Mapping[str, str],
+    wanted: Mapping[str, Area],
     get: Get,
     *,
     old_index: Mapping[str, Any],
@@ -240,10 +266,11 @@ async def run_pass(
     started: float | None = None,
     deadline: float = math.inf,
 ) -> Outcome:
-    """One pass over the areas of ``wanted`` (operator id -> area slug).
+    """One pass over the areas of ``wanted`` (operator id -> area and initiator of its rows).
 
-    It asks for the overview once, then for the shutdowns of each area whose overview fields changed,
-    whose last fetch is ``MAX_AGE`` old or that has no file for today. It does nothing when the last
+    It asks for the overview once, then for the shutdowns of the area of each operator whose area's
+    overview fields changed since the operator last got rows, whose last rows are ``MAX_AGE`` old or
+    that has no ``<id>@alerts.json`` for today; operators of one area share its reply. It sends at most ``MAX_REQUESTS`` requests. It does nothing when the last
     pass was under ``PASS_EVERY - PASS_SLACK`` ago or alerts.energy asked us to wait. A 429, a low daily
     quota or passing ``deadline`` (on ``clock``) ends the pass; what it fetched so far is kept.
     ``started`` is the ``clock`` reading taken with ``now``.
@@ -258,17 +285,26 @@ async def run_pass(
     meta["alertsCheckedAt"] = now.isoformat()
     meta.pop("alertsRetryAfter", None)
     stored = old_index.get("alertsAreas")
-    seen: dict[str, Any] = dict(stored) if isinstance(stored, dict) else {}
+    #: Change key and fetch time by operator id: operators of one area may get rows in different passes.
+    seen: dict[str, Any] = {k: v for k, v in stored.items() if k in wanted} if isinstance(stored, dict) else {}
     meta["alertsAreas"] = seen
+    before = dict(seen)
     call = _Paced(get, clock, sleep)
     stopped = False
+    sent = 0
+    bodies: dict[str, Any] = {}
 
     async def ask(path: str) -> Reply | None:
-        nonlocal stopped
+        nonlocal stopped, sent
         if clock() >= deadline:
             stopped = True
             print(f"{SOURCE}: out of time before {path}, stopping", file=sys.stderr)
             return None
+        if sent >= MAX_REQUESTS:
+            stopped = True
+            print(f"{SOURCE}: {MAX_REQUESTS} requests sent, stopping before {path}", file=sys.stderr)
+            return None
+        sent += 1
         try:
             reply = await call(path)
         except AlertsError as err:
@@ -297,31 +333,28 @@ async def run_pass(
         outcome.failed = set(wanted)
         return outcome
 
-    for op_id, slug in wanted.items():
+    for op_id, (slug, initiator) in wanted.items():
         key = keys.get(slug)
-        old = old_index.get(op_id)
         if key is None:
             print(f"{op_id}: {SOURCE} overview has no updated time for {slug}", file=sys.stderr)
             outcome.failed.add(op_id)
             continue
-        if (
-            _fresh(seen.get(slug), key, now)
-            and isinstance(old, dict)
-            and old.get("source") == SOURCE
-            and _has_today(previous / f"{op_id}.json", now.date())
-        ):
+        if _fresh(before.get(op_id), key, now) and _has_today(previous / f"{op_id}@alerts.json", now.date()):
             outcome.unchanged.add(op_id)
             continue
-        if stopped:
-            outcome.failed.add(op_id)
-            continue
-        reply = await ask(f"/source-registry/areas/{slug}/shutdowns")
-        own = oblenergo_rows(reply.body) if reply is not None and isinstance(reply.body, list) else []
+        if slug not in bodies:
+            if stopped:
+                outcome.failed.add(op_id)
+                continue
+            reply = await ask(f"/source-registry/areas/{slug}/shutdowns")
+            bodies[slug] = reply.body if reply is not None else None
+        body = bodies[slug]
+        own = initiator_rows(body, initiator) if isinstance(body, list) else []
         if not own:
-            if reply is not None:
-                print(f"{op_id}: {SOURCE} has no {OBLENERGO} rows for {slug}", file=sys.stderr)
+            if body is not None:
+                print(f"{op_id}: {SOURCE} has no {initiator} rows for {slug}", file=sys.stderr)
             outcome.failed.add(op_id)
             continue
-        seen[slug] = {"change": key, "fetchedAt": now.isoformat()}
+        seen[op_id] = {"change": key, "fetchedAt": now.isoformat()}
         outcome.rows[op_id] = own
     return outcome

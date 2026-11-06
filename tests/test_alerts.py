@@ -7,7 +7,7 @@ import aiohttp
 import pytest
 from ua_outages.models import EMERGENCY, at
 
-from outage_feed.alerts import AlertsError, alerts_days, live_get, oblenergo_rows
+from outage_feed.alerts import AlertsError, alerts_days, initiator_rows, live_get, oblenergo_rows
 from outage_feed.convert import to_yasno
 
 TODAY = date(2026, 11, 6)
@@ -131,6 +131,22 @@ def test_alerts_days_on_real_responses():
         (1230, 1380),
     ]
     assert sorted(chernivtsi) == ["1", "12", "2"]
+
+
+def test_rows_of_one_initiator_on_real_responses():
+    cases = [
+        ("kyiv", "_oblenergo", 72, 60),
+        ("dnipropetrovska-oblast", "_oblenergo", 24, 12),
+        ("dnipropetrovska-oblast", "_cek", 24, 12),
+        ("vinnytska-oblast-with-rows", "_oblenergo", 33, 9),
+        ("chernigivska-oblast", "_oblenergo", 24, 12),
+    ]
+    for name, initiator, total, own in cases:
+        rows = json.loads((FIXTURES / f"shutdowns-{name}.json").read_text("utf-8"))
+        picked = initiator_rows(rows, initiator)
+        assert (len(rows), len(picked)) == (total, own), (name, initiator)
+        assert all(r["initiator"].endswith(initiator) for r in picked), (name, initiator)
+    assert initiator_rows([{"initiator": None}, "x", {}], "_cek") == []
 
 
 class FakeResponse:
