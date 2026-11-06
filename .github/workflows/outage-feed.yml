@@ -1,0 +1,54 @@
+name: outage-feed
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: outage-feed
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Fetch the published feed
+        run: |
+          url="https://github.com/${GITHUB_REPOSITORY}.git"
+          status=0
+          git ls-remote --exit-code --heads "$url" outage-feed >/dev/null || status=$?
+          case $status in
+            0) git clone --depth 1 --branch outage-feed "$url" previous ;;
+            2) mkdir previous ;;
+            *) echo "git ls-remote failed with exit code $status" >&2; exit 1 ;;
+          esac
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+
+      - run: uv sync --locked
+
+      - name: Collect schedules
+        run: uv run python -m outage_feed.collect --out out --previous previous
+
+      - name: Publish as one orphan commit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          cd out
+          git init --initial-branch=outage-feed
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Update outage schedules"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" outage-feed
