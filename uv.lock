@@ -169,7 +169,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "ukraine-energy-monitor", git = "https://github.com/fastiuk/ukraine-energy-monitor?rev=v0.5.2" }]
+requires-dist = [{ name = "ukraine-energy-monitor", git = "https://github.com/fastiuk/ukraine-energy-monitor?rev=v0.6.1" }]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8" }]
@@ -611,8 +611,8 @@ wheels = [
 
 [[package]]
 name = "ukraine-energy-monitor"
-version = "0.5.2"
-source = { git = "https://github.com/fastiuk/ukraine-energy-monitor?rev=v0.5.2#28cc2b5fef4251560199da2a598644eb5fede4ea" }
+version = "0.6.1"
+source = { git = "https://github.com/fastiuk/ukraine-energy-monitor?rev=v0.6.1#af18fe2dac4a0132e7e6ea8e8608b643e3640b70" }
 dependencies = [
     { name = "aiohttp" },
     { name = "certifi" },

@@ -13,7 +13,7 @@ from typing import Any, NamedTuple
 
 import aiohttp
 from ua_outages.http import MAX_BYTES, USER_AGENT, redact, ssl_context
-from ua_outages.models import EMERGENCY, DaySchedule, Outage, at, merge_outages
+from ua_outages.models import EMERGENCY, KYIV, DaySchedule, Outage, at, merge_outages
 
 SOURCE = "alerts.energy"
 BASE_URL = "https://alerts.energy/api/v1"
@@ -21,7 +21,6 @@ KEY_VARIABLE = "ALERTS_ENERGY_KEY"
 
 #: Operators whose only source is alerts.energy: operator id -> area slug.
 ALERTS_ONLY = {
-    "kharkiv-oe": "kharkivska-oblast",
     "poltava-oe": "poltavska-oblast",
     "zaporizhzhia-oe": "zaporizka-oblast",
     "chernivtsi-oe": "chernivecka-oblast",
@@ -29,6 +28,7 @@ ALERTS_ONLY = {
 }
 #: Operators that read alerts.energy as the last source, when every free source failed.
 ALERTS_FALLBACK = {
+    "kharkiv-oe": "kharkivska-oblast",
     "dtek-krem": "kyivska-oblast",
     "zhytomyr-oe": "zhytomyrska-oblast",
     "kirovohrad-oe": "kirovogradska-oblast",
@@ -39,7 +39,7 @@ ALERTS_FALLBACK = {
     "chernihiv-oe": "chernigivska-oblast",
 }
 #: Fallback operators whose own source counts as failed when it gives no queue: its reply is days without hours.
-ALERTS_IF_EMPTY = frozenset({"chernihiv-oe"})
+ALERTS_IF_EMPTY = frozenset({"chernihiv-oe", "kharkiv-oe"})
 
 
 class Area(NamedTuple):
@@ -48,8 +48,7 @@ class Area(NamedTuple):
     initiator: str = "_oblenergo"
 
 
-#: Every operator alerts.energy has rows for, with the area and the initiator of its rows. Each gets
-#: ``<id>@alerts.json``; ``ALERTS_ONLY`` and ``ALERTS_FALLBACK`` say when that file is also ``<id>.json``.
+#: Includes operators whose existing ``<id>@alerts.json`` is carried forward for source-specific readers.
 ALERTS_AREAS = {
     "dtek-kem": Area("kyiv"),
     "dtek-dnem": Area("dnipropetrovska-oblast"),
@@ -61,11 +60,11 @@ PASS_EVERY = timedelta(minutes=30)
 #: GitHub starts cron runs late by varying amounts, so a run a little under ``PASS_EVERY`` still passes.
 PASS_SLACK = timedelta(minutes=5)
 #: An area fetched this long ago is fetched again even if the overview shows no change.
-MAX_AGE = timedelta(hours=2)
+MAX_AGE = timedelta(hours=6)
 #: Requests one pass may send, the overview included.
-MAX_REQUESTS = 20
+MAX_REQUESTS = 8
 MIN_GAP = 0.5
-MIN_DAILY_REMAINING = 2000
+MIN_DAILY_REMAINING = 30
 DEFAULT_RETRY_AFTER = 60
 OVERVIEW = "/source-registry/areas/overview"
 OBLENERGO = "_oblenergo"
@@ -197,6 +196,23 @@ def _remaining(reply: Reply) -> int | None:
         return None
 
 
+#: ``x-ratelimit-daily-reset`` values above this are Unix seconds; smaller ones are seconds from the reply.
+_EPOCH_FROM = 10**9
+
+
+def _daily_reset(reply: Reply, replied: datetime) -> datetime:
+    """When the daily quota resets: from ``x-ratelimit-daily-reset``, else the next midnight in Kyiv."""
+    midnight = at(replied.astimezone(KYIV).date() + timedelta(days=1), 0)
+    try:
+        value = float(reply.headers["x-ratelimit-daily-reset"])
+    except (KeyError, ValueError):
+        return midnight
+    if not math.isfinite(value):
+        return midnight
+    reset = datetime.fromtimestamp(value, KYIV) if value > _EPOCH_FROM else replied + timedelta(seconds=value)
+    return reset if replied < reset <= replied + timedelta(days=1) else midnight
+
+
 class _Paced:
     """Requests one after another, at least ``MIN_GAP`` seconds apart."""
 
@@ -272,7 +288,8 @@ async def run_pass(
     overview fields changed since the operator last got rows, whose last rows are ``MAX_AGE`` old or
     that has no ``<id>@alerts.json`` for today; operators of one area share its reply. It sends at most ``MAX_REQUESTS`` requests. It does nothing when the last
     pass was under ``PASS_EVERY - PASS_SLACK`` ago or alerts.energy asked us to wait. A 429, a low daily
-    quota or passing ``deadline`` (on ``clock``) ends the pass; what it fetched so far is kept.
+    quota or passing ``deadline`` (on ``clock``) ends the pass; what it fetched so far is kept. A 429 pauses
+    passes until its ``Retry-After``, a low daily quota until the daily reset.
     ``started`` is the ``clock`` reading taken with ``now``.
     """
     started = clock() if started is None else started
@@ -286,7 +303,7 @@ async def run_pass(
     meta.pop("alertsRetryAfter", None)
     stored = old_index.get("alertsAreas")
     #: Change key and fetch time by operator id: operators of one area may get rows in different passes.
-    seen: dict[str, Any] = {k: v for k, v in stored.items() if k in wanted} if isinstance(stored, dict) else {}
+    seen: dict[str, Any] = {k: v for k, v in stored.items() if k in ALERTS_AREAS} if isinstance(stored, dict) else {}
     meta["alertsAreas"] = seen
     before = dict(seen)
     call = _Paced(get, clock, sleep)
@@ -324,7 +341,9 @@ async def run_pass(
             quota = left
         if left is not None and left < MIN_DAILY_REMAINING:
             stopped = True
-            print(f"{SOURCE}: {left} requests left today, stopping", file=sys.stderr)
+            resume = _daily_reset(reply, now + timedelta(seconds=clock() - started))
+            meta["alertsRetryAfter"] = resume.isoformat()
+            print(f"{SOURCE}: {left} requests left today, stopping until {meta['alertsRetryAfter']}", file=sys.stderr)
         if reply.status != 200:
             print(f"{SOURCE}: HTTP {reply.status} on {path}", file=sys.stderr)
             return None

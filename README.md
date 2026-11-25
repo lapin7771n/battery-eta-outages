@@ -6,4 +6,4 @@ The `outage-feed` branch holds one JSON file per grid operator plus `index.json`
 
 Schedules come from the operators' public pages, read through [ua_outages](https://github.com/fastiuk/ukraine-energy-monitor) (MIT, Copyright (c) 2026 Yevhen Fastiuk).
 
-Oblasts without a free source are filled from [alerts.energy](https://alerts.energy) (paid API, key in the `ALERTS_ENERGY_KEY` secret). Their `index.json` entries carry `source: "alerts.energy"`.
+[alerts.energy](https://alerts.energy) is the only source for Poltava, Zaporizhzhia, Chernivtsi and Vinnytsia oblasts. For Kharkiv, Kyiv oblast, Zhytomyr, Kirovohrad, Mykolaiv, Odesa, Sumy, Cherkasy and Chernihiv, the feed requests the area's paid schedule only when its free sources fail in that run. A Chernihiv or Kharkiv response with no queue schedule also counts as a failure. The API key lives in the `ALERTS_ENERGY_KEY` secret. Schedules from alerts.energy carry `source: "alerts.energy"` in `index.json`.
