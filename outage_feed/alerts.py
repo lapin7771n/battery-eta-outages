@@ -292,10 +292,11 @@ async def run_pass(
     call = _Paced(get, clock, sleep)
     stopped = False
     sent = 0
+    quota: int | None = None
     bodies: dict[str, Any] = {}
 
     async def ask(path: str) -> Reply | None:
-        nonlocal stopped, sent
+        nonlocal stopped, sent, quota
         if clock() >= deadline:
             stopped = True
             print(f"{SOURCE}: out of time before {path}, stopping", file=sys.stderr)
@@ -319,7 +320,9 @@ async def run_pass(
             stopped = True
             print(f"{SOURCE}: HTTP 429 on {path}, stopping", file=sys.stderr)
             return None
-        if (left := _remaining(reply)) is not None and left < MIN_DAILY_REMAINING:
+        if (left := _remaining(reply)) is not None:
+            quota = left
+        if left is not None and left < MIN_DAILY_REMAINING:
             stopped = True
             print(f"{SOURCE}: {left} requests left today, stopping", file=sys.stderr)
         if reply.status != 200:
@@ -327,34 +330,38 @@ async def run_pass(
             return None
         return reply
 
-    overview = await ask(OVERVIEW)
-    keys = _change_keys(overview.body) if overview is not None else None
-    if keys is None:
-        outcome.failed = set(wanted)
-        return outcome
+    try:
+        overview = await ask(OVERVIEW)
+        keys = _change_keys(overview.body) if overview is not None else None
+        if keys is None:
+            outcome.failed = set(wanted)
+            return outcome
 
-    for op_id, (slug, initiator) in wanted.items():
-        key = keys.get(slug)
-        if key is None:
-            print(f"{op_id}: {SOURCE} overview has no updated time for {slug}", file=sys.stderr)
-            outcome.failed.add(op_id)
-            continue
-        if _fresh(before.get(op_id), key, now) and _has_today(previous / f"{op_id}@alerts.json", now.date()):
-            outcome.unchanged.add(op_id)
-            continue
-        if slug not in bodies:
-            if stopped:
+        for op_id, (slug, initiator) in wanted.items():
+            key = keys.get(slug)
+            if key is None:
+                print(f"{op_id}: {SOURCE} overview has no updated time for {slug}", file=sys.stderr)
                 outcome.failed.add(op_id)
                 continue
-            reply = await ask(f"/source-registry/areas/{slug}/shutdowns")
-            bodies[slug] = reply.body if reply is not None else None
-        body = bodies[slug]
-        own = initiator_rows(body, initiator) if isinstance(body, list) else []
-        if not own:
-            if body is not None:
-                print(f"{op_id}: {SOURCE} has no {initiator} rows for {slug}", file=sys.stderr)
-            outcome.failed.add(op_id)
-            continue
-        seen[op_id] = {"change": key, "fetchedAt": now.isoformat()}
-        outcome.rows[op_id] = own
-    return outcome
+            if _fresh(before.get(op_id), key, now) and _has_today(previous / f"{op_id}@alerts.json", now.date()):
+                outcome.unchanged.add(op_id)
+                continue
+            if slug not in bodies:
+                if stopped:
+                    outcome.failed.add(op_id)
+                    continue
+                reply = await ask(f"/source-registry/areas/{slug}/shutdowns")
+                bodies[slug] = reply.body if reply is not None else None
+            body = bodies[slug]
+            own = initiator_rows(body, initiator) if isinstance(body, list) else []
+            if not own:
+                if body is not None:
+                    print(f"{op_id}: {SOURCE} has no {initiator} rows for {slug}", file=sys.stderr)
+                outcome.failed.add(op_id)
+                continue
+            seen[op_id] = {"change": key, "fetchedAt": now.isoformat()}
+            outcome.rows[op_id] = own
+        return outcome
+    finally:
+        left_text = "unknown" if quota is None else str(quota)
+        print(f"{SOURCE}: pass sent {sent} requests, {left_text} left today", file=sys.stderr)

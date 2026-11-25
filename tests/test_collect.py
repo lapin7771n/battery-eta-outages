@@ -425,7 +425,7 @@ def test_alerts_refetches_what_changed_is_two_hours_old_or_lacks_a_file_for_toda
     assert asked_at(145) == [OVERVIEW] + [shutdowns_path(slug) for slug in fetched_at_start]
 
 
-def test_alerts_pass_stops_on_429_and_on_a_low_daily_quota(tmp_path):
+def test_alerts_pass_stops_on_429_and_on_a_low_daily_quota(tmp_path, capsys):
     poltava = shutdowns_path("poltavska-oblast")
     order = list(ALERTS_ONLY.values()) + list(ALERTS_FALLBACK.values())
     until_poltava = [OVERVIEW] + [shutdowns_path(slug) for slug in order[:2]]
@@ -446,6 +446,8 @@ def test_alerts_pass_stops_on_429_and_on_a_low_daily_quota(tmp_path):
         index, out = run(operators, directory, **kwargs)
 
         assert api.paths() == until_poltava, name
+        left = "1999" if name == "quota" else "unknown"
+        assert f"alerts.energy: pass sent 3 requests, {left} left today" in capsys.readouterr().err, name
         assert index["kharkiv-oe"]["ok"] is True, name
         assert index["poltava-oe"]["ok"] is (name == "quota"), name
         assert head(index["zaporizhzhia-oe"]) == {"updatedAt": None, "source": None, "ok": False}, name
