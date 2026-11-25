@@ -25,6 +25,7 @@ from outage_feed.alerts import (
     ALERTS_IF_EMPTY,
     ALERTS_ONLY,
     KEY_VARIABLE,
+    MAX_AGE,
     META_KEYS,
     SOURCE,
     Area,
@@ -194,6 +195,16 @@ def _keep_previous(op_id: str, out: Path, previous: Path) -> None:
         (out / old_file.name).write_bytes(old_file.read_bytes())
 
 
+def _within_max_age(stamp: Any, now: datetime) -> bool:
+    if not isinstance(stamp, str):
+        return False
+    try:
+        updated = datetime.fromisoformat(stamp)
+    except ValueError:
+        return False
+    return updated.tzinfo is not None and now - updated <= MAX_AGE
+
+
 def _source_entry(sid: str, name: str, ok: bool, updated: Any, feed: Any) -> dict:
     return {"id": sid, "name": name, "ok": ok, "updatedAt": updated, "queues": _queues(feed)}
 
@@ -342,7 +353,8 @@ async def collect(
                 alerts_feed = kept if isinstance(kept, dict) else None
             entry = _publish_source(out, previous, op.id, "alerts", SOURCE, alerts_feed, now, old_entry)
             if entry and state == "skipped" and old_entry:
-                entry = {**entry, "ok": old_entry.get("ok") is True, "updatedAt": old_entry.get("updatedAt")}
+                ok = old_entry.get("ok") is True and _within_max_age(old_entry.get("updatedAt"), now)
+                entry = {**entry, "ok": ok, "updatedAt": old_entry.get("updatedAt")}
             if entry:
                 entries.append(entry)
 

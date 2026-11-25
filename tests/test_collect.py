@@ -756,17 +756,26 @@ def test_excluded_operators_keep_their_previous_alerts_source(tmp_path):
     api = FakeAlerts()
     previous = tmp_path / "previous"
     previous.mkdir()
+    fresh = (NOW - timedelta(hours=5)).isoformat()
+    stale = (NOW - timedelta(hours=7)).isoformat()
+    cases = (
+        ("dtek-kem", Working(), False, fresh, False),
+        ("dtek-dnem", Failing(), True, fresh, True),
+        ("cek", Failing(), True, stale, False),
+        ("zhytomyr-oe", Working(), True, "not-a-timestamp", False),
+        ("sumy-oe", Working(), True, None, False),
+    )
     old_index = {}
     operators = []
-    for op_id, source, old_ok in (
-        ("dtek-kem", Working(), False),
-        ("dtek-dnem", Failing(), True),
-        ("cek", Failing(), False),
-    ):
+    expected = {}
+    for op_id, source, old_ok, stamp, expected_ok in cases:
         operators.append(registry_operator(op_id, source))
         (previous / f"{op_id}@alerts.json").write_text(OLD_FILE)
-        entry = {"id": "alerts", "name": "alerts.energy", "ok": old_ok, "updatedAt": OLD_STAMP, "queues": ["1.1"]}
+        entry = {"id": "alerts", "name": "alerts.energy", "ok": old_ok, "queues": ["1.1"]}
+        if stamp is not None:
+            entry["updatedAt"] = stamp
         old_index[op_id] = {"sources": [entry]}
+        expected[op_id] = {**entry, "ok": expected_ok, "updatedAt": stamp}
     (previous / "index.json").write_text(json.dumps(old_index))
 
     index, out = alerts_run(operators, tmp_path, api)
@@ -774,7 +783,7 @@ def test_excluded_operators_keep_their_previous_alerts_source(tmp_path):
     assert api.calls == []
     for op in operators:
         assert (out / f"{op.id}@alerts.json").read_text() == OLD_FILE
-        assert index[op.id]["sources"][-1] == old_index[op.id]["sources"][0]
+        assert index[op.id]["sources"][-1] == expected[op.id]
     assert today_slots(out / "dtek-kem.json") == [{"start": 480, "end": 690, "type": "Definite"}]
     for op_id in ("dtek-dnem", "cek"):
         assert not index[op_id]["ok"] and not (out / f"{op_id}.json").exists()
