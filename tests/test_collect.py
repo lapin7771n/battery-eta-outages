@@ -339,6 +339,7 @@ def test_alerts_feeds_the_listed_operators_and_backs_up_the_rest(tmp_path):
     assert (out / "zhytomyr-oe.json").read_bytes() == paid_file
 
     api.reset()
+    fetched_mode = api.areas["zhytomyrska-oblast"]["mode"]
     api.areas["zhytomyrska-oblast"]["mode"] = "emergency"
     recovered, out = next_run([poltava, operator("zhytomyr-oe", Working())], tmp_path, 60, **kwargs)
     assert api.paths() == [OVERVIEW]
@@ -346,6 +347,17 @@ def test_alerts_feeds_the_listed_operators_and_backs_up_the_rest(tmp_path):
     assert recovered["zhytomyr-oe"]["sources"][-1] == failed["zhytomyr-oe"]["sources"][-1]
     assert recovered["zhytomyr-oe"]["source"] == "Working"
     assert today_slots(out / "zhytomyr-oe.json") == [{"start": 480, "end": 690, "type": "Definite"}]
+
+    api.reset()
+    api.areas["zhytomyrska-oblast"]["mode"] = fetched_mode
+    again, out = next_run([poltava, operator("zhytomyr-oe", Failing())], tmp_path, 90, **kwargs)
+    assert api.paths() == [OVERVIEW]
+    assert head(again["zhytomyr-oe"]) == {
+        "updatedAt": (NOW + timedelta(minutes=90)).isoformat(),
+        "source": "alerts.energy",
+        "ok": True,
+    }
+    assert (out / "zhytomyr-oe.json").read_bytes() == paid_file
 
 
 def all_alerts_operators(failing=ALERTS_FALLBACK):
@@ -440,45 +452,57 @@ def test_alerts_pass_stops_on_429_and_on_a_low_daily_quota(tmp_path, capsys):
     order = list(ALERTS_ONLY.values()) + list(ALERTS_FALLBACK.values())
     until_zaporizhzhia = [OVERVIEW] + [shutdowns_path(slug) for slug in order[:2]]
     assert until_zaporizhzhia[-1] == zaporizhzhia
+    replied_at = NOW + timedelta(seconds=3 * 45 + 2 * 0.5)
+    epoch_reset = NOW + timedelta(hours=9)
+    cases = (
+        ("429", {"retry-after": "3600"}, replied_at + timedelta(seconds=3600)),
+        ("quota, Unix reset", {"x-ratelimit-daily-reset": str(int(epoch_reset.timestamp()))}, epoch_reset),
+        ("quota, reset in seconds", {"x-ratelimit-daily-reset": "7200"}, replied_at + timedelta(seconds=7200)),
+    )
+    midnight = at(NOW.date() + timedelta(days=1), 0)
+    for name, reset in (
+        ("missing", None),
+        ("unparseable", "soon"),
+        ("in the past", str(int(NOW.timestamp()) - 60)),
+        ("over a day away", str(int((NOW + timedelta(days=2)).timestamp()))),
+    ):
+        cases += ((f"quota, reset {name}", {} if reset is None else {"x-ratelimit-daily-reset": reset}, midnight),)
 
-    for name in ("429", "quota"):
+    for name, headers, resume in cases:
         directory = tmp_path / name
         directory.mkdir()
         api = FakeAlerts()
         api.delay = 45
-        if name == "429":
-            api.status[zaporizhzhia], api.headers[zaporizhzhia] = 429, {"retry-after": "3600"}
-        else:
+        quota = name != "429"
+        if quota:
             api.headers[OVERVIEW] = {"x-ratelimit-daily-remaining": "30"}
-            api.headers[zaporizhzhia] = {"x-ratelimit-daily-remaining": "29"}
+            api.headers[zaporizhzhia] = {"x-ratelimit-daily-remaining": "29", **headers}
+        else:
+            api.status[zaporizhzhia], api.headers[zaporizhzhia] = 429, headers
         operators = all_alerts_operators(failing=())
         kwargs = {"alerts_get": api.get, "clock": api.clock.time, "sleep": api.clock.sleep}
 
         index, out = run(operators, directory, **kwargs)
 
         assert api.paths() == until_zaporizhzhia, name
-        left = "29" if name == "quota" else "unknown"
+        left = "29" if quota else "unknown"
         assert f"alerts.energy: pass sent 3 requests, {left} left today" in capsys.readouterr().err, name
         assert index["poltava-oe"]["ok"] is True, name
-        assert index["zaporizhzhia-oe"]["ok"] is (name == "quota"), name
+        assert index["zaporizhzhia-oe"]["ok"] is quota, name
         assert head(index["chernivtsi-oe"]) == {"updatedAt": None, "source": None, "ok": False}, name
         assert not (out / "chernivtsi-oe.json").exists(), name
-        assert ("alertsRetryAfter" in index) == (name == "429"), name
-        if name == "429":
-            replied_at = NOW + timedelta(seconds=3 * 45 + 2 * 0.5)
-            retry_after = datetime.fromisoformat(index["alertsRetryAfter"])
-            assert abs(retry_after - (replied_at + timedelta(seconds=3600))) < timedelta(seconds=1)
+        retry_after = datetime.fromisoformat(index["alertsRetryAfter"])
+        assert abs(retry_after - resume) < timedelta(seconds=1), name
 
         api.reset()
         api.status.clear()
         api.delay = 0
-        next_run(operators, directory, 40, **kwargs)
-        assert (len(api.calls) == 0) == (name == "429"), name
+        next_run(operators, directory, (resume - NOW) / timedelta(minutes=1) - 5, **kwargs)
+        assert api.calls == [], name
 
-        api.reset()
-        next_run(operators, directory, 70, **kwargs)
+        next_run(operators, directory, (resume - NOW) / timedelta(minutes=1) + 1, **kwargs)
         assert api.paths()[0] == OVERVIEW, name
-        assert (len(api.calls) > 1) == (name == "429"), name
+        assert len(api.calls) > 1, name
 
 
 def test_alerts_network_error_fails_only_that_area(tmp_path):
@@ -818,8 +842,11 @@ def test_daily_alerts_budget_with_two_failing_fallbacks(tmp_path):
     kwargs = {"alerts_get": api.get, "clock": api.clock.time, "sleep": api.clock.sleep}
     hour = 0
     expected_slot = {"start": 0, "end": 240, "type": "Definite"}
+    changes = range(1, 24, 3)
+    fetched_at = []
     for step in range(48):
-        if step % 6 == 1:
+        before = len(api.calls)
+        if step in changes:
             hour += 1
             expected_slot = {"start": hour * 60, "end": (hour + 1) * 60, "type": "Definite"}
             for slug, area in api.areas.items():
@@ -834,9 +861,13 @@ def test_daily_alerts_budget_with_two_failing_fallbacks(tmp_path):
             assert (index[op.id]["source"] == "alerts.energy") == (op.id in wanted)
             if op.id in wanted:
                 assert today_slots(out / f"{op.id}.json") == [expected_slot]
+        if len(api.calls) - before > 1:
+            fetched_at.append(step)
 
+    assert len(changes) == 8
+    assert fetched_at == [0, *changes, 34, 46]
     assert api.paths().count(OVERVIEW) == 48
-    assert len(api.calls) <= 220
+    assert len(api.calls) == 48 + len(wanted) * len(fetched_at) == 114
 
 
 def test_an_alerts_pass_stops_at_the_request_cap(tmp_path):
@@ -991,14 +1022,24 @@ def test_kharkiv_reads_its_telegram_channel_and_leaves_alerts_energy_alone(tmp_p
     assert feed == feed_file(out, "kharkiv-oe@telegram-kharkivenergy")
 
 
-def test_kharkiv_falls_back_to_alerts_energy_when_its_telegram_channel_fails(tmp_path, monkeypatch):
-    index, out, api = kharkiv_run(tmp_path, monkeypatch, None)
+def test_kharkiv_falls_back_to_alerts_energy_when_its_telegram_channel_fails_or_shows_no_schedule(
+    tmp_path, monkeypatch
+):
+    no_schedule = '<html><body><section class="tgme_channel_history js-message_history"></section></body></html>'
+    for name, page, sources in (
+        ("fails", None, ["alerts"]),
+        ("no schedule", no_schedule, ["telegram-kharkivenergy", "alerts"]),
+    ):
+        directory = tmp_path / name
+        directory.mkdir()
 
-    assert api.paths() == [OVERVIEW, shutdowns_path("kharkivska-oblast")]
-    assert head(index["kharkiv-oe"]) == {
-        "updatedAt": KHARKIV_NOW.isoformat(),
-        "source": "alerts.energy",
-        "ok": True,
-    }
-    assert [e["id"] for e in index["kharkiv-oe"]["sources"]] == ["alerts"]
-    assert feed_file(out, "kharkiv-oe") == feed_file(out, "kharkiv-oe@alerts")
+        index, out, api = kharkiv_run(directory, monkeypatch, page)
+
+        assert api.paths() == [OVERVIEW, shutdowns_path("kharkivska-oblast")], name
+        assert head(index["kharkiv-oe"]) == {
+            "updatedAt": KHARKIV_NOW.isoformat(),
+            "source": "alerts.energy",
+            "ok": True,
+        }, name
+        assert [e["id"] for e in index["kharkiv-oe"]["sources"]] == sources, name
+        assert feed_file(out, "kharkiv-oe") == feed_file(out, "kharkiv-oe@alerts"), name
