@@ -170,6 +170,10 @@ def _has_plan(feed: dict[str, dict]) -> bool:
     return any(day["status"] != WAITING for days in feed.values() for day in days.values())
 
 
+def _own_empty(op: Operator, result: tuple[str, dict[date, DaySchedule]] | None, today: date) -> bool:
+    return result is None or (op.id in ALERTS_IF_EMPTY and not _has_plan(to_yasno(result[1], op.groups, today)))
+
+
 def _failed_entry(old_index: dict, op_id: str) -> dict:
     old = old_index.get(op_id)
     old = old if isinstance(old, dict) else {}
@@ -268,7 +272,6 @@ async def collect(
         if op.id in ALERTS_ONLY or (not op.by_address and any(not s.ukraine_only for s in op.sources))
     ]
     jobs = [(op, s) for op in polled if op.id not in ALERTS_ONLY for s in op.sources if not s.ukraine_only]
-    wanted = {op.id: ALERTS_AREAS[op.id] for op in polled if op.id in ALERTS_AREAS}
 
     async def fetch_all() -> list[dict | None]:
         shared: dict[tuple[Any, ...], asyncio.Task[Response]] = {}
@@ -283,15 +286,21 @@ async def collect(
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
 
-    async def alerts() -> Outcome | None:
-        if not wanted:
-            return None
-        return await _alerts_pass(wanted, alerts_get, old_index, previous, now, started, alerts_timeout, clock, sleep)
-
-    answers, outcome = await asyncio.gather(fetch_all(), alerts())
+    answers = await fetch_all()
     fetched: dict[str, list[tuple[Provider, dict | None]]] = {}
     for (op, source), days in zip(jobs, answers, strict=True):
         fetched.setdefault(op.id, []).append((source, days))
+
+    results = {op.id: _pick(fetched.get(op.id, [])) for op in polled}
+    wanted = {op.id: ALERTS_AREAS[op.id] for op in polled if op.id in ALERTS_ONLY}
+    wanted.update(
+        (op.id, ALERTS_AREAS[op.id])
+        for op in polled
+        if op.id in ALERTS_FALLBACK and _own_empty(op, results[op.id], today)
+    )
+    outcome = None
+    if wanted:
+        outcome = await _alerts_pass(wanted, alerts_get, old_index, previous, now, started, alerts_timeout, clock, sleep)
 
     index: dict[str, Any] = {}
     for op in polled:
@@ -309,9 +318,9 @@ async def collect(
             entry = _publish_source(out, previous, op.id, sid, source_label(source), feed, now, old_sources.get(sid))
             if entry:
                 entries.append(entry)
-        result = _pick(fetched.get(op.id, []))
+        result = results[op.id]
 
-        state = None
+        state = "skipped" if op.id in ALERTS_AREAS else None
         if op.id in wanted and outcome is not None:
             state = (
                 "rows"
@@ -337,10 +346,7 @@ async def collect(
             if entry:
                 entries.append(entry)
 
-        own_empty = result is None or (
-            op.id in ALERTS_IF_EMPTY and not _has_plan(to_yasno(result[1], op.groups, today))
-        )
-        use_alerts = op.id in ALERTS_ONLY or (op.id in ALERTS_FALLBACK and own_empty)
+        use_alerts = op.id in wanted
         stamp = {"updatedAt": now.isoformat(), "source": SOURCE, "ok": True}
         if use_alerts and state in ("rows", "unchanged"):
             alerts_file = out / f"{op.id}@alerts.json"

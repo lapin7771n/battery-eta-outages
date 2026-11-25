@@ -48,8 +48,7 @@ class Area(NamedTuple):
     initiator: str = "_oblenergo"
 
 
-#: Every operator alerts.energy has rows for, with the area and the initiator of its rows. Each gets
-#: ``<id>@alerts.json``; ``ALERTS_ONLY`` and ``ALERTS_FALLBACK`` say when that file is also ``<id>.json``.
+#: Includes operators whose existing ``<id>@alerts.json`` is carried forward for source-specific readers.
 ALERTS_AREAS = {
     "dtek-kem": Area("kyiv"),
     "dtek-dnem": Area("dnipropetrovska-oblast"),
@@ -61,11 +60,11 @@ PASS_EVERY = timedelta(minutes=30)
 #: GitHub starts cron runs late by varying amounts, so a run a little under ``PASS_EVERY`` still passes.
 PASS_SLACK = timedelta(minutes=5)
 #: An area fetched this long ago is fetched again even if the overview shows no change.
-MAX_AGE = timedelta(hours=2)
+MAX_AGE = timedelta(hours=6)
 #: Requests one pass may send, the overview included.
-MAX_REQUESTS = 20
+MAX_REQUESTS = 8
 MIN_GAP = 0.5
-MIN_DAILY_REMAINING = 2000
+MIN_DAILY_REMAINING = 30
 DEFAULT_RETRY_AFTER = 60
 OVERVIEW = "/source-registry/areas/overview"
 OBLENERGO = "_oblenergo"

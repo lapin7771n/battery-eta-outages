@@ -16,7 +16,6 @@ from ua_outages.providers.kirovohrad import CHANNELS, Kirovohrad
 from ua_outages.providers.yasno import Yasno
 from ua_outages.registry import OPERATORS, OPERATORS_BY_ID, Operator
 
-from outage_feed import alerts
 from outage_feed.alerts import ALERTS_AREAS, ALERTS_FALLBACK, ALERTS_ONLY, AlertsError, Reply
 from outage_feed.collect import collect, source_id, source_label
 
@@ -96,11 +95,11 @@ def run(operators, tmp_path, now=NOW, **kwargs):
     return asyncio.run(collect(operators, out, previous, now=now, **kwargs)), out
 
 
-def next_run(operators, tmp_path, minutes, **kwargs):
+def next_run(operators, tmp_path, minutes, *, start=NOW, **kwargs):
     """Publish the last output as the previous feed, then collect ``minutes`` later."""
     shutil.rmtree(tmp_path / "previous", ignore_errors=True)
     (tmp_path / "out").rename(tmp_path / "previous")
-    return run(operators, tmp_path, now=NOW + timedelta(minutes=minutes), **kwargs)
+    return run(operators, tmp_path, now=start + timedelta(minutes=minutes), **kwargs)
 
 
 def head(entry):
@@ -265,10 +264,6 @@ def real(name):
     return json.loads((ALERTS / f"shutdowns-{name}-oblast.json").read_text("utf-8"))
 
 
-def fallback_operators():
-    return [operator(op_id, Failing()) for op_id in ALERTS_FALLBACK]
-
-
 def alerts_run(operators, tmp_path, api, **kwargs):
     return run(operators, tmp_path, alerts_get=api.get, clock=api.clock.time, sleep=api.clock.sleep, **kwargs)
 
@@ -289,11 +284,10 @@ def test_alerts_feeds_the_listed_operators_and_backs_up_the_rest(tmp_path):
         operator("poltava-oe", Working(), AbroadOnly()),
         operator("zaporizhzhia-oe"),
         operator("chernivtsi-oe", Working(), groups=("1", "2")),
-        operator("dtek-krem", Failing()),
+        operator("dtek-krem", Failing(), Slow()),
         operator("zhytomyr-oe", Working()),
         operator("dtek-oem", Empty()),
         operator("sumy-oe", Failing()),
-        operator("cherkasy-oe", Failing(), Slow()),
         operator("vinnytsia-oe", Failing()),
         operator("kherson-oe"),
     ]
@@ -321,7 +315,6 @@ def test_alerts_feeds_the_listed_operators_and_backs_up_the_rest(tmp_path):
     assert "kherson-oe" not in index
     assert (out / "sumy-oe.json").read_text() == OLD_FILE
     assert head(index["sumy-oe"]) == {"updatedAt": None, "source": None, "ok": False}
-    assert index["cherkasy-oe"]["source"] == "alerts.energy"
     assert api.paths()[0] == OVERVIEW
     asked = {path.split("/")[-2] for path in api.paths()[1:]}
     assert asked == {
@@ -331,30 +324,48 @@ def test_alerts_feeds_the_listed_operators_and_backs_up_the_rest(tmp_path):
         "chernivecka-oblast",
         "kyivska-oblast",
         "sumska-oblast",
-        "cherkaska-oblast",
         "vinnytska-oblast",
-        "zhytomyrska-oblast",
-        "odeska-oblast",
     }
-    assert [e["id"] for e in index["zhytomyr-oe"]["sources"]] == ["operator", "alerts"]
+    assert [e["id"] for e in index["zhytomyr-oe"]["sources"]] == ["operator"]
+
+    kwargs = {"alerts_get": api.get, "clock": api.clock.time, "sleep": api.clock.sleep}
+    kharkiv = operator("kharkiv-oe")
+    api.reset()
+    failed, out = next_run([kharkiv, operator("zhytomyr-oe", Failing())], tmp_path, 30, **kwargs)
+    assert api.paths() == [OVERVIEW, shutdowns_path("zhytomyrska-oblast")]
+    assert failed["zhytomyr-oe"]["source"] == "alerts.energy"
+    paid_file = (out / "zhytomyr-oe@alerts.json").read_bytes()
+    assert (out / "zhytomyr-oe.json").read_bytes() == paid_file
+
+    api.reset()
+    api.areas["zhytomyrska-oblast"]["mode"] = "emergency"
+    recovered, out = next_run([kharkiv, operator("zhytomyr-oe", Working())], tmp_path, 60, **kwargs)
+    assert api.paths() == [OVERVIEW]
+    assert (out / "zhytomyr-oe@alerts.json").read_bytes() == paid_file
+    assert recovered["zhytomyr-oe"]["sources"][-1] == failed["zhytomyr-oe"]["sources"][-1]
+    assert recovered["zhytomyr-oe"]["source"] == "Working"
+    assert today_slots(out / "zhytomyr-oe.json") == [{"start": 480, "end": 690, "type": "Definite"}]
 
 
-def all_alerts_operators():
-    return [operator(op_id) for op_id in ALERTS_ONLY] + fallback_operators()
+def all_alerts_operators(failing=ALERTS_FALLBACK):
+    return [operator(op_id) for op_id in ALERTS_ONLY] + [
+        operator(op_id, Failing() if op_id in failing else Working())
+        for op_id in ALERTS_AREAS if op_id not in ALERTS_ONLY
+    ]
 
 
 def test_alerts_budget(tmp_path):
     api = FakeAlerts()
-    operators = all_alerts_operators()
+    operators = all_alerts_operators(failing={"dtek-krem"})
     kwargs = {"alerts_get": api.get, "clock": api.clock.time, "sleep": api.clock.sleep}
 
     first, _ = alerts_run(operators, tmp_path, api)
-    assert len(api.calls) == 1 + len(SLUGS) == 14
+    assert len(api.calls) == 7
     assert [path for path, _ in api.calls][0] == OVERVIEW
     times = [at for _, at in api.calls]
     assert all(b - a >= 0.5 - 1e-9 for a, b in zip(times, times[1:], strict=False))
     assert first["alertsCheckedAt"] == NOW.isoformat()
-    assert sorted(first["alertsAreas"]) == sorted(SLUGS)
+    assert set(first["alertsAreas"]) == set(ALERTS_ONLY) | {"dtek-krem"}
     assert first["alertsAreas"]["poltava-oe"] == {
         "change": ["2026-11-06T10:49:29.000Z", "regional-emergency", True, False, "regional"],
         "fetchedAt": NOW.isoformat(),
@@ -364,7 +375,7 @@ def test_alerts_budget(tmp_path):
     soon, _ = next_run(operators, tmp_path, 24, **kwargs)
     assert api.calls == []
     assert soon["alertsCheckedAt"] == NOW.isoformat()
-    assert all(soon[op_id] == first[op_id] for op_id in SLUGS)
+    assert all(soon[op_id] == first[op_id] for op_id in first["alertsAreas"])
     assert soon["kharkiv-oe"]["sources"] == first["kharkiv-oe"]["sources"]
 
     unchanged, _ = next_run(operators, tmp_path, 26, **kwargs)
@@ -391,14 +402,14 @@ def test_alerts_budget(tmp_path):
     for area in api.areas.values():
         area["updated"] = "2026-11-06T11:00:00.000Z"
     next_run(operators, tmp_path, 80, **kwargs)
-    assert len(api.calls) == 14
+    assert len(api.calls) == 7
     times = [at for _, at in api.calls]
     assert all(b - a >= 0.5 - 1e-9 for a, b in zip(times, times[1:], strict=False))
 
 
-def test_alerts_refetches_what_changed_is_two_hours_old_or_lacks_a_file_for_today(tmp_path):
+def test_alerts_refetches_what_changed_is_six_hours_old_or_lacks_a_file_for_today(tmp_path):
     api = FakeAlerts()
-    operators = all_alerts_operators()
+    operators = all_alerts_operators(failing={"dtek-krem"})
     kwargs = {"alerts_get": api.get, "clock": api.clock.time, "sleep": api.clock.sleep}
     alerts_run(operators, tmp_path, api)
 
@@ -419,10 +430,8 @@ def test_alerts_refetches_what_changed_is_two_hours_old_or_lacks_a_file_for_toda
     (tmp_path / "out" / "dtek-krem@alerts.json").unlink()
     assert asked_at(116) == [OVERVIEW, shutdowns_path("kyivska-oblast")]
 
-    fetched_at_start = ["chernivecka-oblast", "vinnytska-oblast"] + [
-        slug for slug in ALERTS_FALLBACK.values() if slug != "kyivska-oblast"
-    ]
-    assert asked_at(145) == [OVERVIEW] + [shutdowns_path(slug) for slug in fetched_at_start]
+    assert asked_at(330) == [OVERVIEW]
+    assert asked_at(360) == [OVERVIEW, shutdowns_path("chernivecka-oblast"), shutdowns_path("vinnytska-oblast")]
 
 
 def test_alerts_pass_stops_on_429_and_on_a_low_daily_quota(tmp_path, capsys):
@@ -439,14 +448,15 @@ def test_alerts_pass_stops_on_429_and_on_a_low_daily_quota(tmp_path, capsys):
         if name == "429":
             api.status[poltava], api.headers[poltava] = 429, {"retry-after": "3600"}
         else:
-            api.headers[poltava] = {"x-ratelimit-daily-remaining": "1999"}
-        operators = all_alerts_operators()
+            api.headers[OVERVIEW] = {"x-ratelimit-daily-remaining": "30"}
+            api.headers[poltava] = {"x-ratelimit-daily-remaining": "29"}
+        operators = all_alerts_operators(failing=())
         kwargs = {"alerts_get": api.get, "clock": api.clock.time, "sleep": api.clock.sleep}
 
         index, out = run(operators, directory, **kwargs)
 
         assert api.paths() == until_poltava, name
-        left = "1999" if name == "quota" else "unknown"
+        left = "29" if name == "quota" else "unknown"
         assert f"alerts.energy: pass sent 3 requests, {left} left today" in capsys.readouterr().err, name
         assert index["kharkiv-oe"]["ok"] is True, name
         assert index["poltava-oe"]["ok"] is (name == "quota"), name
@@ -481,12 +491,12 @@ def test_alerts_network_error_fails_only_that_area(tmp_path):
     old_entry = {"updatedAt": OLD_STAMP, "source": "alerts.energy", "ok": True, "sources": [old_source]}
     (previous / "index.json").write_text(json.dumps({"poltava-oe": old_entry}))
 
-    index, out = alerts_run(all_alerts_operators(), tmp_path, api)
+    index, out = alerts_run(all_alerts_operators(failing={"sumy-oe"}), tmp_path, api)
 
     assert head(index["poltava-oe"]) == {"updatedAt": OLD_STAMP, "source": "alerts.energy", "ok": False}
     assert (out / "poltava-oe.json").read_text() == (out / "poltava-oe@alerts.json").read_text() == OLD_FILE
     assert index["poltava-oe"]["sources"] == [{**old_source, "ok": False}]
-    assert len(api.calls) == 14
+    assert len(api.calls) == 7
     others = [op_id for op_id in SLUGS if op_id != "poltava-oe"]
     assert all(index[op_id]["ok"] and (out / f"{op_id}.json").exists() for op_id in others)
 
@@ -515,7 +525,15 @@ def test_alerts_pass_keeps_what_it_fetched_before_the_deadline(tmp_path):
     api = FakeAlerts()
     api.delay = 50
 
-    index, out = alerts_run(all_alerts_operators(), tmp_path, api, alerts_timeout=120)
+    class SlowFree(Working):
+        async def fetch(self, http, now):
+            await api.clock.sleep(150)
+            return await super().fetch(http, now)
+
+    operators = [operator("free", SlowFree()), *all_alerts_operators()]
+    index, out = alerts_run(operators, tmp_path, api, alerts_timeout=120)
+
+    assert index["free"]["ok"] and api.calls[0][1] == 1150
 
     assert api.paths() == [OVERVIEW, shutdowns_path("kharkivska-oblast"), shutdowns_path("poltavska-oblast")]
     assert index["kharkiv-oe"]["ok"] is True and index["poltava-oe"]["ok"] is True
@@ -633,13 +651,12 @@ def test_every_source_of_an_operator_gets_its_own_file_and_index_entry(tmp_path)
     assert sorted(feed_file(out, "dtek-dnem@dtek-site")) == ["1.1"]
     waiting = feed_file(out, "dtek-dnem@dtek-mirror")
     assert [day["status"] for day in waiting["1.1"].values()] == ["WaitingForSchedule"] * 2
-    assert feed_file(out, "dtek-dnem@alerts")["1.1"]["today"]["status"] == "ScheduleApplies"
+    assert not (out / "dtek-dnem@alerts.json").exists()
     stamp = NOW.isoformat()
     assert index["dtek-dnem"]["sources"] == [
         {"id": "yasno", "name": "YASNO", "ok": True, "updatedAt": stamp, "queues": ["1.1", "2.1", "10.1"]},
         {"id": "dtek-site", "name": "Сайт ДТЕК", "ok": True, "updatedAt": stamp, "queues": ["1.1"]},
         {"id": "dtek-mirror", "name": "Копія ДТЕК (outage-data-ua)", "ok": True, "updatedAt": stamp, "queues": ["1.1", "2.1", "10.1"]},
-        {"id": "alerts", "name": "alerts.energy", "ok": True, "updatedAt": stamp, "queues": ["1.1", "2.1"]},
     ]
     assert json.loads((out / "index.json").read_text())["dtek-dnem"] == index["dtek-dnem"]
     assert feed_file(out, "dtek-dnem") == yasno
@@ -660,7 +677,6 @@ def test_a_failed_source_keeps_its_previous_file_and_the_others_are_written(tmp_
     assert [(e["id"], e["ok"]) for e in index["dtek-dnem"]["sources"]] == [
         ("yasno", True),
         ("dtek-site", False),
-        ("alerts", True),
     ]
     assert index["dtek-dnem"]["sources"][1] == {**old_sources[0], "ok": False}
     assert today_slots(out / "dtek-dnem@yasno.json") == [{"start": 480, "end": 690, "type": "Definite"}]
@@ -691,7 +707,6 @@ def test_the_two_telegram_channels_of_kirovohrad_get_their_own_files(tmp_path):
     assert [(e["id"], e["name"]) for e in index["kirovohrad-oe"]["sources"]] == [
         ("telegram-svitlokropyvnytskyimisto", "Telegram: SvitloKropyvnytskyiMisto"),
         ("telegram-svitlooleksandriyskohoraionu", "Telegram: SvitloOleksandriyskohoRaionu"),
-        ("alerts", "alerts.energy"),
     ]
     assert feed_file(out, "kirovohrad-oe@telegram-svitlokropyvnytskyimisto") == feed_file(
         out, "kirovohrad-oe@telegram-svitlooleksandriyskohoraionu"
@@ -731,37 +746,39 @@ def test_chernihiv_keeps_its_own_telegram_schedule_when_it_has_queues(tmp_path):
 
     assert head(index["chernihiv-oe"])["source"] != "alerts.energy"
     assert feed_file(out, "chernihiv-oe")["1.1"]["today"]["slots"] == [{"start": 480, "end": 690, "type": "Definite"}]
-    assert feed_file(out, "chernihiv-oe@alerts")["1.1"]["today"]["status"] == "EmergencyShutdowns"
+    assert not (out / "chernihiv-oe@alerts.json").exists()
+    assert api.calls == []
 
 
-def test_alerts_rows_come_from_the_operators_own_initiator_only(tmp_path):
-    api = FakeAlerts(
-        {
-            "kyiv": fixture_rows("kyiv"),
-            "dnipropetrovska-oblast": fixture_rows("dnipropetrovska-oblast"),
-        }
-    )
-    operators = [
-        registry_operator("dtek-kem", Working()),
-        registry_operator("dtek-dnem", Working()),
-        registry_operator("cek", Working()),
-    ]
+def test_excluded_operators_keep_their_previous_alerts_source(tmp_path):
+    api = FakeAlerts()
+    previous = tmp_path / "previous"
+    previous.mkdir()
+    old_index = {}
+    operators = []
+    for op_id, source, old_ok in (
+        ("dtek-kem", Working(), False),
+        ("dtek-dnem", Failing(), True),
+        ("cek", Failing(), False),
+    ):
+        operators.append(registry_operator(op_id, source))
+        (previous / f"{op_id}@alerts.json").write_text(OLD_FILE)
+        entry = {"id": "alerts", "name": "alerts.energy", "ok": old_ok, "updatedAt": OLD_STAMP, "queues": ["1.1"]}
+        old_index[op_id] = {"sources": [entry]}
+    (previous / "index.json").write_text(json.dumps(old_index))
 
     index, out = alerts_run(operators, tmp_path, api)
 
-    kem = feed_file(out, "dtek-kem@alerts")
-    assert kem["1.1"]["today"]["status"] == "EmergencyShutdowns"
-    assert len(kem) == 60
-    assert sorted(kem["1.1"]) == ["today", "tomorrow"] and "1.2" not in kem
-    assert [e["queues"] for e in index["dtek-kem"]["sources"] if e["id"] == "alerts"][0][-1] == "60.1"
-    dnem, cek = feed_file(out, "dtek-dnem@alerts"), feed_file(out, "cek@alerts")
-    assert cek["1.1"]["today"]["slots"][0] == {"start": 0, "end": 150, "type": "Definite"}
-    assert dnem["1.1"]["today"]["slots"] != cek["1.1"]["today"]["slots"]
-    assert api.paths().count(shutdowns_path("dnipropetrovska-oblast")) == 1
-    assert api.paths().count(shutdowns_path("kyiv")) == 1
+    assert api.calls == []
+    for op in operators:
+        assert (out / f"{op.id}@alerts.json").read_text() == OLD_FILE
+        assert index[op.id]["sources"][-1] == old_index[op.id]["sources"][0]
+    assert today_slots(out / "dtek-kem.json") == [{"start": 480, "end": 690, "type": "Definite"}]
+    for op_id in ("dtek-dnem", "cek"):
+        assert not index[op_id]["ok"] and not (out / f"{op_id}.json").exists()
 
 
-def test_a_pass_over_every_alerts_operator_sends_one_request_per_area(tmp_path):
+def test_daily_alerts_budget_with_two_failing_fallbacks(tmp_path):
     assert sorted(ALERTS_AREAS) == sorted(
         [
             "dtek-kem",
@@ -782,55 +799,46 @@ def test_a_pass_over_every_alerts_operator_sends_one_request_per_area(tmp_path):
             "chernihiv-oe",
         ]
     )
-    api = FakeAlerts({"dnipropetrovska-oblast": fixture_rows("dnipropetrovska-oblast")})
-    operators = [registry_operator(op_id, Failing()) for op_id in ALERTS_AREAS]
-
-    index, _ = alerts_run(operators, tmp_path, api)
-
-    assert len(api.calls) == 1 + len({a.slug for a in ALERTS_AREAS.values()}) == 16
-    assert all(e["id"] == "alerts" and e["ok"] for op_id in ALERTS_AREAS for e in index[op_id]["sources"]), index
-
-
-def test_an_alerts_pass_stops_at_the_request_cap(tmp_path, monkeypatch):
-    monkeypatch.setattr(alerts, "MAX_REQUESTS", 3)
     api = FakeAlerts()
-
-    index, out = alerts_run(all_alerts_operators(), tmp_path, api)
-
-    assert api.paths() == [OVERVIEW, shutdowns_path("kharkivska-oblast"), shutdowns_path("poltavska-oblast")]
-    assert index["kharkiv-oe"]["ok"] and index["poltava-oe"]["ok"] and not index["zaporizhzhia-oe"]["ok"]
-    assert not (out / "zaporizhzhia-oe@alerts.json").exists()
-
-
-def test_operators_of_one_area_both_refresh_when_the_area_changes(tmp_path):
-    api = dnipro_api()
-    operators = [registry_operator("dtek-dnem", Working()), registry_operator("cek", Working())]
+    failing = {"dtek-krem", "sumy-oe"}
+    operators = all_alerts_operators(failing)
+    wanted = set(ALERTS_ONLY) | failing
+    start = at(NOW.date(), 0)
     kwargs = {"alerts_get": api.get, "clock": api.clock.time, "sleep": api.clock.sleep}
-    alerts_run(operators, tmp_path, api)
-    api.reset()
-    api.areas["dnipropetrovska-oblast"]["mode"] = "emergency"
-    for row in api.shutdowns["dnipropetrovska-oblast"]:
-        row["today"] = [1] * 24
+    hour = 0
+    expected_slot = {"start": 0, "end": 240, "type": "Definite"}
+    for step in range(48):
+        if step % 6 == 1:
+            hour += 1
+            expected_slot = {"start": hour * 60, "end": (hour + 1) * 60, "type": "Definite"}
+            for slug, area in api.areas.items():
+                area["updated"] = (start + timedelta(minutes=30 * step)).isoformat()
+                api.shutdowns[slug] = [{**own_row(slug), "today": [0] * hour + [1] + [0] * (23 - hour)}]
+        if step == 0:
+            index, out = run(operators, tmp_path, now=start, **kwargs)
+        else:
+            index, out = next_run(operators, tmp_path, 30 * step, start=start, **kwargs)
+        for op in operators:
+            assert index[op.id]["ok"]
+            assert (index[op.id]["source"] == "alerts.energy") == (op.id in wanted)
+            if op.id in wanted:
+                assert today_slots(out / f"{op.id}.json") == [expected_slot]
 
-    _, out = next_run(operators, tmp_path, 30, **kwargs)
+    assert api.paths().count(OVERVIEW) == 48
+    assert len(api.calls) <= 220
 
-    assert api.paths() == [OVERVIEW, shutdowns_path("dnipropetrovska-oblast")]
-    for op_id in ("dtek-dnem", "cek"):
-        whole_day = [{"start": 0, "end": 1440, "type": "Definite"}]
-        assert feed_file(out, f"{op_id}@alerts")["1.1"]["today"]["slots"] == whole_day
 
-    api.areas["dnipropetrovska-oblast"]["updated"] = "2026-11-06T11:00:00.000Z"
-    rows = api.shutdowns["dnipropetrovska-oblast"]
-    api.shutdowns["dnipropetrovska-oblast"] = [r for r in rows if not r["initiator"].endswith("_cek")]
-    next_run(operators, tmp_path, 60, **kwargs)
-    api.reset()
+def test_an_alerts_pass_stops_at_the_request_cap(tmp_path):
+    api = FakeAlerts()
+    operators = sorted(all_alerts_operators(), key=lambda op: op.id in ALERTS_ONLY)
 
-    index, _ = next_run(operators, tmp_path, 90, **kwargs)
+    index, out = alerts_run(operators, tmp_path, api)
 
-    assert api.paths() == [OVERVIEW, shutdowns_path("dnipropetrovska-oblast")]
-    cek = [e for e in index["cek"]["sources"] if e["id"] == "alerts"]
-    assert cek == [{**cek[0], "ok": False, "updatedAt": (NOW + timedelta(minutes=30)).isoformat()}]
-    assert [e["ok"] for e in index["dtek-dnem"]["sources"] if e["id"] == "alerts"] == [True]
+    fetched = list(ALERTS_ONLY) + ["dtek-krem", "zhytomyr-oe"]
+    assert api.paths() == [OVERVIEW] + [shutdowns_path(SLUGS[op_id]) for op_id in fetched]
+    for op_id in SLUGS:
+        assert index[op_id]["ok"] == (op_id in fetched)
+        assert (out / f"{op_id}@alerts.json").exists() == (op_id in fetched)
 
 
 class Channel(Working):
