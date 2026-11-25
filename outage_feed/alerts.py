@@ -21,7 +21,6 @@ KEY_VARIABLE = "ALERTS_ENERGY_KEY"
 
 #: Operators whose only source is alerts.energy: operator id -> area slug.
 ALERTS_ONLY = {
-    "kharkiv-oe": "kharkivska-oblast",
     "poltava-oe": "poltavska-oblast",
     "zaporizhzhia-oe": "zaporizka-oblast",
     "chernivtsi-oe": "chernivecka-oblast",
@@ -29,6 +28,7 @@ ALERTS_ONLY = {
 }
 #: Operators that read alerts.energy as the last source, when every free source failed.
 ALERTS_FALLBACK = {
+    "kharkiv-oe": "kharkivska-oblast",
     "dtek-krem": "kyivska-oblast",
     "zhytomyr-oe": "zhytomyrska-oblast",
     "kirovohrad-oe": "kirovogradska-oblast",
